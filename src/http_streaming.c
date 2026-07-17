@@ -4,8 +4,7 @@
  *	  Streaming HTTP query driver for pg_clickhouse.
  *
  *	  Uses curl_multi + CURL_WRITEFUNC_PAUSE to receive ClickHouse HTTP
- *	  responses in row-aligned batches of approximately fetch_size bytes,
- *	  keeping memory proportional to batch size instead of full result set.
+ *	  responses in byte batches, keeping memory proportional to fetch_size.
  *
  * Copyright (c) 2025-2026, ClickHouse, Inc.
  *
@@ -53,10 +52,9 @@ struct HttpStream {
     size_t buf_allocated;
     size_t write_pos;
     size_t parse_pos;
-    size_t batch_end;
     int32 fetch_size; /* approximate batch size in bytes */
+    bool native;
     bool paused;
-    bool started;
     bool transfer_done;
     char error_buffer[CURL_ERROR_SIZE];
 
@@ -73,10 +71,8 @@ static void
 setup_curl(HttpStream* stream, const ch_query* query);
 static void
 capture_transfer_info(HttpStream* stream);
-static void
-compact_buffer(HttpStream* stream);
-static size_t
-find_batch_end(const HttpStream* stream);
+static int
+pump(HttpStream* stream);
 static size_t
 write_callback(void* contents, size_t size, size_t nmemb, void* userp);
 
@@ -96,11 +92,29 @@ setup_curl(HttpStream* stream, const ch_query* query) {
     snprintf(temp_buf, sizeof(temp_buf), "query_id=%s", stream->query_id);
     curl_url_set(cu, CURLUPART_QUERY, temp_buf, CURLU_APPENDQUERY | CURLU_URLENCODE);
 
+    /* Settings overridden below win over user settings. */
+    static const char* const native_overridden[] = {
+        "default_format",
+        "output_format_native_encode_types_in_binary_format",
+        "output_format_native_write_json_as_string",
+        NULL,
+    };
+    static const char* const tsv_overridden[] = {
+        "date_time_output_format",
+        "format_tsv_null_representation",
+        "output_format_tsv_crlf_end_of_line",
+        NULL,
+    };
+    const char* const* overridden = stream->native ? native_overridden : tsv_overridden;
+
     kv_iter iter = new_kv_iter(query->settings);
     while (kv_iter_next(&iter)) {
-        if (strcmp(iter.name, "date_time_output_format") == 0 ||
-            strcmp(iter.name, "format_tsv_null_representation") == 0 ||
-            strcmp(iter.name, "output_format_tsv_crlf_end_of_line") == 0) {
+        const char* const* skip = overridden;
+
+        while (*skip && strcmp(iter.name, *skip) != 0) {
+            skip++;
+        }
+        if (*skip) {
             continue;
         }
         snprintf(temp_buf, sizeof(temp_buf), "%s=%s", iter.name, iter.value);
@@ -109,24 +123,56 @@ setup_curl(HttpStream* stream, const ch_query* query) {
         );
     }
 
-    curl_url_set(
-        cu,
-        CURLUPART_QUERY,
-        "date_time_output_format=iso",
-        CURLU_APPENDQUERY | CURLU_URLENCODE
-    );
-    curl_url_set(
-        cu,
-        CURLUPART_QUERY,
-        "format_tsv_null_representation=\\N",
-        CURLU_APPENDQUERY | CURLU_URLENCODE
-    );
-    curl_url_set(
-        cu,
-        CURLUPART_QUERY,
-        "output_format_tsv_crlf_end_of_line=0",
-        CURLU_APPENDQUERY | CURLU_URLENCODE
-    );
+    if (stream->native) {
+        int major, minor, patch;
+
+        /* Keep SQL unchanged so query parameters work. */
+        curl_url_set(
+            cu,
+            CURLUPART_QUERY,
+            "default_format=Native",
+            CURLU_APPENDQUERY | CURLU_URLENCODE
+        );
+
+        ch_http_server_version(stream->conn, &major, &minor, &patch);
+
+        /* Gate settings by server version, unknown HTTP settings fail queries. */
+        if (major > 24 || (major == 24 && minor >= 7)) {
+            curl_url_set(
+                cu,
+                CURLUPART_QUERY,
+                "output_format_native_encode_types_in_binary_format=0",
+                CURLU_APPENDQUERY | CURLU_URLENCODE
+            );
+        }
+        if (major > 24 || (major == 24 && minor >= 10)) {
+            curl_url_set(
+                cu,
+                CURLUPART_QUERY,
+                "output_format_native_write_json_as_string=1",
+                CURLU_APPENDQUERY | CURLU_URLENCODE
+            );
+        }
+    } else {
+        curl_url_set(
+            cu,
+            CURLUPART_QUERY,
+            "date_time_output_format=iso",
+            CURLU_APPENDQUERY | CURLU_URLENCODE
+        );
+        curl_url_set(
+            cu,
+            CURLUPART_QUERY,
+            "format_tsv_null_representation=\\N",
+            CURLU_APPENDQUERY | CURLU_URLENCODE
+        );
+        curl_url_set(
+            cu,
+            CURLUPART_QUERY,
+            "output_format_tsv_crlf_end_of_line=0",
+            CURLU_APPENDQUERY | CURLU_URLENCODE
+        );
+    }
     curl_url_get(cu, CURLUPART_URL, &stream->url, 0);
     curl_url_cleanup(cu);
 
@@ -184,8 +230,7 @@ setup_curl(HttpStream* stream, const ch_query* query) {
 
 /* ----------------------------------------------------------------
  * write_callback — CURL write callback. Appends data to the stream
- * buffer and asks CURL to pause receipt once a row-aligned batch of
- * approximately fetch_size bytes is buffered.
+ * buffer and asks CURL to pause receipt near fetch_size bytes.
  * ----------------------------------------------------------------
  */
 static size_t
@@ -216,15 +261,7 @@ write_callback(void* contents, size_t size, size_t nmemb, void* userp) {
     self->write_pos += realsize;
     self->buf[self->write_pos] = '\0';
 
-    /*
-     * Once we have buffered at least fetch_size bytes AND at least one
-     * newline (so a row-aligned batch is ready), pause receipt. Pausing on
-     * byte-count alone can starve the parser of the newline it needs when
-     * fetch_size is small. We accept this chunk first and pause afterward via
-     * curl_easy_pause so CURL does not redeliver bytes we already hold.
-     */
-    if (self->write_pos >= (size_t)self->fetch_size &&
-        memchr(self->buf, '\n', self->write_pos) != NULL) {
+    if (self->fetch_size > 0 && self->write_pos >= (size_t)self->fetch_size) {
         self->paused = true;
         curl_easy_pause(self->curl, CURLPAUSE_RECV);
     }
@@ -243,102 +280,20 @@ capture_transfer_info(HttpStream* stream) {
         stream->curl, CURLINFO_PRETRANSFER_TIME, &stream->pretransfer_time
     );
     curl_easy_getinfo(stream->curl, CURLINFO_TOTAL_TIME, &stream->total_time);
-    stream->started = true;
 }
 
-/* ----------------------------------------------------------------
- * find_batch_end — find a row-aligned split point near fetch_size
- * bytes. Looks forward then backward for nearest newline. Never
- * returns a partial row: if no newline is buffered, returns 0 so
- * the caller keeps ingesting.
- * ----------------------------------------------------------------
- */
-static size_t
-find_batch_end(const HttpStream* stream) {
-    const char* base = stream->buf;
-    const char* found;
-
-    if (stream->fetch_size <= 0) {
-        return stream->write_pos;
-    }
-
-    if (stream->write_pos >= (size_t)stream->fetch_size) {
-        /* Look forward first */
-        found = memchr(
-            base + stream->fetch_size, '\n', stream->write_pos - stream->fetch_size
-        );
-        if (found) {
-            return (found - base) + 1;
-        }
-
-        /* Look backward */
-        for (size_t i = stream->fetch_size; i > 0; i--) {
-            if (base[i - 1] == '\n') {
-                return i;
-            }
-        }
-    }
-
-    if (stream->transfer_done) {
-        return stream->write_pos;
-    }
-
-    return 0;
-}
-
-/* ----------------------------------------------------------------
- * compact_buffer — shift unparsed data to the front of the buffer.
- * ----------------------------------------------------------------
- */
-static void
-compact_buffer(HttpStream* stream) {
-    if (stream->parse_pos > 0) {
-        size_t remaining = stream->write_pos - stream->parse_pos;
-
-        memmove(stream->buf, stream->buf + stream->parse_pos, remaining);
-        stream->write_pos              = remaining;
-        stream->parse_pos              = 0;
-        stream->batch_end              = 0;
-        stream->buf[stream->write_pos] = '\0';
-    }
-}
-
-/* ----------------------------------------------------------------
- * http_stream_pump — drive curl_multi until the next batch is ready or the
- * transfer completes. Returns 0 on success, -1 on error.
- * ----------------------------------------------------------------
- */
-int
-ch_http_stream_pump(HttpStream* stream) {
+static int
+pump(HttpStream* stream) {
     int running_handles;
     CURLMcode mc;
     CURLMsg* msg;
     int msgs_left;
 
-    /*
-     * Drop the already-consumed batch and see if there is enough buffered
-     * data for the next one before touching the network again.
-     */
-    if (stream->parse_pos > 0) {
-        compact_buffer(stream);
-    }
-
-    stream->batch_end = find_batch_end(stream);
-    if (stream->batch_end > 0 ||
-        (stream->transfer_done && stream->write_pos <= stream->parse_pos)) {
-        if (!stream->started) {
-            capture_transfer_info(stream);
-        }
-        return 0;
-    }
-
-    /* Resume if paused from a previous batch */
     if (stream->paused) {
         stream->paused = false;
         curl_easy_pause(stream->curl, CURLPAUSE_CONT);
     }
 
-    /* Drive the transfer */
     for (;;) {
         mc = curl_multi_perform(stream->multi, &running_handles);
         if (mc != CURLM_OK) {
@@ -352,8 +307,9 @@ ch_http_stream_pump(HttpStream* stream) {
             stream->transfer_done = true;
         }
 
-        stream->batch_end = find_batch_end(stream);
-        if (stream->batch_end > 0 || stream->paused || stream->transfer_done) {
+        /* fetch_size 0 waits for complete response. */
+        if (stream->paused || stream->transfer_done ||
+            (stream->fetch_size > 0 && stream->write_pos > 0)) {
             break;
         }
 
@@ -361,9 +317,6 @@ ch_http_stream_pump(HttpStream* stream) {
     }
 
     capture_transfer_info(stream);
-    stream->batch_end = find_batch_end(stream);
-
-    /* Check for transfer errors */
     while ((msg = curl_multi_info_read(stream->multi, &msgs_left))) {
         if (msg->msg == CURLMSG_DONE && msg->data.result != CURLE_OK) {
             if (msg->data.result == CURLE_ABORTED_BY_CALLBACK) {
@@ -384,6 +337,35 @@ ch_http_stream_pump(HttpStream* stream) {
     return 0;
 }
 
+/* Blocking byte reader for clickhouse-c chc_io. */
+int
+ch_http_stream_read(HttpStream* stream, void* dst, size_t len, size_t* out_n) {
+    size_t avail;
+
+    *out_n = 0;
+
+    while (stream->parse_pos >= stream->write_pos) {
+        if (stream->transfer_done) {
+            return 0; /* clean EOF */
+        }
+        /* Reuse buffer after complete drain. */
+        stream->parse_pos = 0;
+        stream->write_pos = 0;
+        if (pump(stream) < 0) {
+            return -1;
+        }
+    }
+
+    avail = stream->write_pos - stream->parse_pos;
+    if (len < avail) {
+        avail = len;
+    }
+    memcpy(dst, stream->buf + stream->parse_pos, avail);
+    stream->parse_pos += avail;
+    *out_n = avail;
+    return 0;
+}
+
 /* ----------------------------------------------------------------
  * Public API — lifecycle
  * ----------------------------------------------------------------
@@ -397,7 +379,8 @@ HttpStream*
 ch_http_stream_begin(
     ch_http_connection_t* conn,
     const ch_query* query,
-    int32 fetch_size
+    int32 fetch_size,
+    bool native
 ) {
     HttpStream* stream;
     uuid_t id;
@@ -409,6 +392,7 @@ ch_http_stream_begin(
 
     stream->conn       = conn;
     stream->fetch_size = fetch_size;
+    stream->native     = native;
 
     /* Generate query ID */
     uuid_generate(id);
@@ -441,8 +425,13 @@ ch_http_stream_begin(
     }
     curl_multi_add_handle(stream->multi, stream->curl);
 
-    /* Pump until first batch is ready or transfer completes */
-    ch_http_stream_pump(stream);
+    pump(stream);
+    if (native && stream->http_status > 0 && stream->http_status != CH_HTTP_STATUS_OK &&
+        stream->http_status != CH_HTTP_STATUS_CANCELED &&
+        stream->http_status != CH_HTTP_STATUS_TRANSPORT_ERROR) {
+        stream->fetch_size = 0;
+        pump(stream);
+    }
 
     return stream;
 
@@ -501,21 +490,7 @@ ch_http_stream_buffer(HttpStream* stream) {
 
 size_t
 ch_http_stream_available(HttpStream* stream) {
-    return stream->batch_end > stream->parse_pos ? stream->batch_end - stream->parse_pos
-                                                 : 0;
-}
-
-void
-ch_http_stream_advance(HttpStream* stream, size_t n) {
-    stream->parse_pos += n;
-    if (stream->parse_pos > stream->batch_end) {
-        stream->parse_pos = stream->batch_end;
-    }
-}
-
-bool
-ch_http_stream_transfer_done(HttpStream* stream) {
-    return stream->transfer_done && (stream->write_pos <= stream->parse_pos);
+    return stream->write_pos - stream->parse_pos;
 }
 
 long

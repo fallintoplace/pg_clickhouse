@@ -19,6 +19,7 @@
 #include "binary.h"
 #include "fdw.h"
 #include "http.h"
+#include "http_native.h"
 #include "http_streaming.h"
 
 #include <fcntl.h>
@@ -31,26 +32,30 @@ static void
 http_disconnect(void* conn);
 static ch_cursor*
 http_simple_query(void* conn, const ch_query* query);
-static ch_cursor*
-http_streaming_query(void* conn, const ch_query* query, int32 fetch_size);
 static void
 http_simple_insert(void* conn, const ch_query* query);
 static void
 http_cursor_free(void*);
+static ch_cursor*
+http_native_cursor(void* conn, const ch_query* query, int32 fetch_size);
 static void
-http_streaming_cursor_free(void*);
+http_native_read_error(ch_cursor* cursor);
+static void
+native_cursor_state_free(void*);
+static void
+native_cursor_raise_error(ch_cursor* cursor);
 static Datum*
-http_fetch_row(ChFdwScanRowContext* ctx);
+apply_binary_row(ChFdwScanRowContext* ctx);
 static Datum*
-http_streaming_fetch_row(ChFdwScanRowContext* ctx);
-static Datum*
-http_fetch_row_from_state(ChFdwScanRowContext* ctx, ch_http_read_state* state);
+native_fetch_row(ChFdwScanRowContext* ctx);
+static void
+binary_fetch_row_errcb(void* arg);
+static void
+configure_native_cursor(ch_cursor* cursor, const ch_query* query);
 static void*
 http_prepare_insert(void*, ResultRelInfo*, List*, const ch_query*, char*);
 static void
 http_insert_tuple(void*, TupleTableSlot*);
-static void
-char_to_datum(ChFdwScanRowContext* ctx, int attnum, char* data, size_t len);
 static void
 report_http_stream_query_failure(void* conn, const ch_query* query, HttpStream* stream);
 static ch_server_version
@@ -59,11 +64,11 @@ http_server_version(void* conn);
 static libclickhouse_methods http_methods = {
     .disconnect          = http_disconnect,
     .simple_query        = http_simple_query,
-    .fetch_row           = http_fetch_row,
+    .fetch_row           = native_fetch_row,
     .prepare_insert      = http_prepare_insert,
     .insert_tuple        = http_insert_tuple,
-    .streaming_query     = http_streaming_query,
-    .streaming_fetch_row = http_streaming_fetch_row,
+    .streaming_query     = http_native_cursor,
+    .streaming_fetch_row = native_fetch_row,
     .server_version      = http_server_version,
 };
 
@@ -77,8 +82,6 @@ static bool
 binary_is_broken(const void* conn);
 
 /* static void binary_simple_insert(void *conn, const char *query); */
-static Datum*
-binary_fetch_row(ChFdwScanRowContext* ctx);
 static void
 binary_insert_tuple(void*, TupleTableSlot* slot);
 static void
@@ -105,7 +108,7 @@ binary_server_version(void* conn);
 static libclickhouse_methods binary_methods = {
     .disconnect          = binary_disconnect,
     .simple_query        = binary_simple_query,
-    .fetch_row           = binary_fetch_row,
+    .fetch_row           = native_fetch_row,
     .prepare_insert      = binary_prepare_insert,
     .insert_tuple        = binary_insert_tuple,
     .finalize_insert     = binary_finalize_insert,
@@ -307,6 +310,9 @@ report_http_stream_query_failure(
 static ch_cursor*
 http_simple_query(void* conn, const ch_query* query) {
     int attempts = 0;
+    if (!query->raw_result) {
+        return http_native_cursor(conn, query, 0);
+    }
     /*
      * volatile: changed after setjmp (PG_TRY) and read after longjmp
      * (PG_CATCH); longjmp needn't restore register-cached locals, so a
@@ -377,11 +383,9 @@ again:
         cursor                 = palloc0(sizeof(ch_cursor));
         cursor->conn           = conn;
         cursor->query_response = resp;
-        cursor->read_state     = palloc0(sizeof(ch_http_read_state));
         cursor->query          = pstrdup(query->sql);
         cursor->request_time   = resp->pretransfer_time * 1000;
         cursor->total_time     = resp->total_time * 1000;
-        ch_http_read_state_init(cursor->read_state, resp->data, resp->datasize);
 
         cursor->memcxt        = tempcxt;
         cursor->callback.func = http_cursor_free;
@@ -445,34 +449,22 @@ http_cursor_free(void* c) {
     ch_http_response_free(((ch_cursor*)c)->query_response);
 }
 
-inline static void
-http_streaming_cursor_free(void* c) {
-    if (((ch_cursor*)c)->query_response) {
-        ch_http_stream_end(((ch_cursor*)c)->query_response);
-    }
-}
-
-/*
- * Create a streaming cursor with row-aligned batches of ~fetch_size bytes
- * via CURL pause/resume, keeping memory proportional to batch size.
- */
+/* Create shared-decoder cursor over HTTP Native response. */
 static ch_cursor*
-http_streaming_query(void* conn, const ch_query* query, int32 fetch_size) {
+http_native_cursor(void* conn, const ch_query* query, int32 fetch_size) {
     int attempts = 0;
-    /*
-     * volatile: changed after setjmp (PG_TRY) and read after longjmp
-     * (PG_CATCH); longjmp needn't restore register-cached locals, so a
-     * non-volatile such local has an indeterminate value per C setjmp rules.
-     */
+    /* volatile: modified inside PG_TRY, read after longjmp in PG_CATCH */
     volatile MemoryContext tempcxt = NULL;
+    HttpStream* volatile stream;
     MemoryContext oldcxt;
     ch_cursor* cursor;
-    HttpStream* stream;
+    ch_http_native* h;
+    pgch_reader* state;
 
     ch_http_set_progress_func(http_progress_callback);
 
 again:
-    stream = ch_http_stream_begin(conn, query, fetch_size);
+    stream = ch_http_stream_begin(conn, query, fetch_size, true);
     if (stream == NULL) {
         ereport(
             ERROR,
@@ -482,11 +474,10 @@ again:
     }
 
     attempts++;
-    if (ch_http_stream_status(stream) == CH_HTTP_STATUS_TRANSPORT_ERROR) {
-        if (attempts < 3) {
-            ch_http_stream_end(stream);
-            goto again;
-        }
+    if (ch_http_stream_status(stream) == CH_HTTP_STATUS_TRANSPORT_ERROR &&
+        attempts < 3) {
+        ch_http_stream_end(stream);
+        goto again;
     }
     if (ch_http_stream_status(stream) != CH_HTTP_STATUS_OK) {
         report_http_stream_query_failure(conn, query, stream);
@@ -494,38 +485,38 @@ again:
 
     PG_TRY();
     {
-        /*
-         * If any palloc below throws, clean up the stream which is not
-         * tracked by a memory context yet.
-         */
         tempcxt = AllocSetContextCreate(
-            PortalContext, "pg_clickhouse streaming cursor", ALLOCSET_DEFAULT_SIZES
+            PortalContext, "pg_clickhouse native cursor", ALLOCSET_DEFAULT_SIZES
         );
         oldcxt = MemoryContextSwitchTo(tempcxt);
 
-        cursor                 = palloc0(sizeof(ch_cursor));
-        cursor->conn           = conn;
-        cursor->query_response = stream;
-        cursor->read_state     = palloc0(sizeof(ch_http_read_state));
-        cursor->query          = pstrdup(query->sql);
-        cursor->request_time   = ch_http_stream_request_time(stream);
-        cursor->total_time     = ch_http_stream_total_time(stream);
+        cursor               = palloc0(sizeof(ch_cursor));
+        cursor->conn         = conn;
+        cursor->query        = pstrdup(query->sql);
+        cursor->request_time = ch_http_stream_request_time(stream);
+        cursor->total_time   = ch_http_stream_total_time(stream);
 
-        ch_http_read_state_init(
-            cursor->read_state,
-            ch_http_stream_buffer(stream),
-            ch_http_stream_available(stream)
-        );
+        /* Transfer ownership before callback registration can fail. */
+        {
+            HttpStream* owned = stream;
+
+            stream = NULL;
+            h      = ch_http_native_begin(owned, tempcxt);
+        }
+        cursor->query_response = h;
+        cursor->read_error     = http_native_read_error;
+        state                  = palloc0(sizeof(pgch_reader));
+        cursor->read_state     = state;
+        pgch_block_source src  = ch_http_native_block_source(h);
+        pgch_reader_init(state, &src);
+        cursor->columns_count = pgch_reader_columns(state);
 
         cursor->memcxt        = tempcxt;
-        cursor->callback.func = http_streaming_cursor_free;
+        cursor->callback.func = native_cursor_state_free;
         cursor->callback.arg  = cursor;
         MemoryContextRegisterResetCallback(tempcxt, &cursor->callback);
 
         MemoryContextSwitchTo(oldcxt);
-
-        /* Ownership transferred to the cursor callback */
-        stream = NULL;
     }
     PG_CATCH();
     {
@@ -539,207 +530,24 @@ again:
     }
     PG_END_TRY();
 
+    if (state->error) {
+        native_cursor_raise_error(cursor);
+    }
+
+    configure_native_cursor(cursor, query);
+
     return cursor;
-}
-
-/*
- * Streaming variant of http_fetch_row. When the parser exhausts the current
- * buffer and the transfer isn't done, pump more data from curl and
- * reinitialize the parser on the refilled buffer.
- */
-static Datum*
-http_streaming_fetch_row(ChFdwScanRowContext* ctx) {
-    ch_cursor* cursor         = ctx->cursor;
-    ch_http_read_state* state = cursor->read_state;
-    HttpStream* stream        = cursor->query_response;
-
-    /* Pump the next batch when the current one has been exhausted. */
-    if (state->done || state->data == NULL) {
-        /* Sync parse position: tell stream how far the parser advanced */
-        ch_http_stream_advance(stream, state->curpos);
-
-        if (ch_http_stream_pump(stream) < 0) {
-            if (ch_http_stream_status(stream) == CH_HTTP_STATUS_CANCELED) {
-                char qid[CH_HTTP_QUERY_ID_LEN];
-
-                memcpy(qid, ch_http_stream_query_id(stream), sizeof(qid));
-                ch_http_stream_end(stream);
-                cursor->query_response = NULL;
-                kill_query(cursor->conn, qid);
-                ereport(
-                    ERROR,
-                    errcode(ERRCODE_SQL_ROUTINE_EXCEPTION),
-                    errmsg("pg_clickhouse: query was aborted")
-                );
-            }
-            ereport(
-                ERROR,
-                errcode(ERRCODE_CONNECTION_FAILURE),
-                errmsg(
-                    "pg_clickhouse: streaming error - %s",
-                    ch_http_stream_error(stream) ? ch_http_stream_error(stream)
-                                                 : "unknown"
-                )
-            );
-        }
-
-        /* Reinitialize parser on the (possibly compacted) buffer */
-        ch_http_read_state_init(
-            state, ch_http_stream_buffer(stream), ch_http_stream_available(stream)
-        );
-    }
-
-    return http_fetch_row_from_state(ctx, state);
-}
-
-static Datum*
-http_fetch_row_from_state(ChFdwScanRowContext* ctx, ch_http_read_state* state) {
-    int rc          = CH_CONT;
-    size_t attcount = list_length(ctx->retrieved_attrs);
-    Datum* values;
-
-    /* All rows or empty table. */
-    if (state->done || state->data == NULL) {
-        return NULL;
-    }
-
-    /* Special case: SELECT NULL. */
-    if (attcount == 0) {
-        Assert(ctx->values && ctx->nulls);
-        rc = ch_http_read_next(state, false);
-        if (rc != CH_CONT && state->is_null) {
-            ctx->nulls[0]  = true;
-            ctx->values[0] = (Datum)0;
-            return ctx->values;
-        }
-
-        ereport(
-            ERROR,
-            errcode(ERRCODE_FDW_ERROR),
-            errmsg("pg_clickhouse: unexpected response for a zero-column result"),
-            errdetail("Expected a NULL marker (\\N) in the TabSeparated response.")
-        );
-    }
-
-    /*
-     * Create Datums based on the retrieved_attrs for the TupleDesc.
-     * ctx->values and ctx->nulls must already be initialized with memory for
-     * ctx->tupdesc->natts Datums.
-     */
-    if (ctx->tupdesc) {
-        values = ctx->values;
-        ListCell* lc;
-        int i;
-
-        Assert(ctx->values && ctx->nulls && ctx->attinmeta);
-        foreach (lc, ctx->retrieved_attrs) {
-            Oid pgtype;
-
-            i      = lfirst_int(lc) - 1;
-            pgtype = TupleDescAttr(ctx->tupdesc, i)->atttypid;
-            rc     = ch_http_read_next(state, type_is_array(pgtype));
-            char_to_datum(
-                ctx, i, state->is_null ? NULL : state->val.data, state->val.len
-            );
-        }
-    }
-    /* No TupleDesc, everything is text. */
-    else {
-        values = palloc(attcount * sizeof(Datum));
-        for (size_t idx = 0; idx < attcount; idx++) {
-            rc = ch_http_read_next(state, false);
-            if (state->is_null) {
-                values[idx] = (Datum)0;
-            } else {
-                values[idx] = PointerGetDatum(cstring_to_text(state->val.data));
-            }
-        }
-    }
-
-    if (attcount > 0 && rc != CH_EOL && rc != CH_EOF) {
-        ereport(
-            ERROR,
-            errcode(ERRCODE_DATATYPE_MISMATCH),
-            errmsg_internal("pg_clickhouse: columns mismatch"),
-            errdetail(
-                "Number of returned columns does not match "
-                "expected column count (%lu).",
-                attcount
-            )
-        );
-    }
-
-    return values;
-}
-
-/*
- * Fetch a row from the http response and return its values.
- *
- * If ctx->tupdesc is set, ctx->attinmeta must also be set, and ctx->values
- * and ctx->nulls must already be palloc'd with space for ctx->tupdesc->natts
- * values.
- *
- * Use ctx->tupdesc and ctx->attinmeta to convert the values to the
- * appropriate Datums, and store them and the indication of their NULLness in
- * ctx->values and ctx->nulls, respectively, then return ctx->values.
- *
- * If ctx->tupdesc is not set, treat all values as text and return them as
- * text `Datum`s. This is the use case for `chfdw_construct_create_tables()`,
- * which only cares about text.
- */
-static Datum*
-http_fetch_row(ChFdwScanRowContext* ctx) {
-    ch_cursor* cursor         = ctx->cursor;
-    ch_http_read_state* state = cursor->read_state;
-
-    return http_fetch_row_from_state(ctx, state);
-}
-
-/*
- * Convert the raw data of length len to a Datum identified by attidx.
- * Determines the Postgres type and input function from the attidx values in
- * ctx->tupdesc and ctx->attinmeta.
- */
-static void
-char_to_datum(ChFdwScanRowContext* ctx, int attidx, char* data, size_t len) {
-    static const char time_prefix[] = "1970-01-01T";
-    Oid pgtype                      = TupleDescAttr(ctx->tupdesc, attidx)->atttypid;
-
-    if (data && len > sizeof(time_prefix) - 1 &&
-        (pgtype == TIMEOID || pgtype == TIMETZOID) && data[len - 1] == 'Z') {
-        /*
-         * date_time_output_format=iso formats times as ISO timestamps. Remove
-         * the leading `YYYY-mm-ddT`.
-         */
-        data += sizeof(time_prefix) - 1;
-    } else if (pgtype == BYTEAOID) {
-        /* Postgres input function won't work, we have raw data. */
-        ctx->nulls[attidx] = data == NULL;
-        ctx->values[attidx] =
-            data == NULL ? (Datum)0
-                         : PointerGetDatum((bytea*)cstring_to_text_with_len(data, len));
-        return;
-    }
-
-    /* Apply the input function even to nulls, to support domains */
-    ctx->nulls[attidx]  = data == NULL;
-    ctx->values[attidx] = InputFunctionCall(
-        &ctx->attinmeta->attinfuncs[attidx],
-        data,
-        ctx->attinmeta->attioparams[attidx],
-        ctx->attinmeta->atttypmods[attidx]
-    );
 }
 
 text*
 chfdw_http_fetch_raw_data(ch_cursor* cursor) {
-    ch_http_read_state* state = cursor->read_state;
+    ch_http_response_t* resp = cursor->query_response;
 
-    if (state->data == NULL) {
+    if (resp->data == NULL) {
         return NULL;
     }
 
-    return cstring_to_text(state->data);
+    return cstring_to_text_with_len(resp->data, resp->datasize);
 }
 
 /*
@@ -978,59 +786,12 @@ binary_simple_query(void* conn, const ch_query* query) {
     cursor->callback.arg  = cursor;
     MemoryContextRegisterResetCallback(tempcxt, &cursor->callback);
 
-    /*
-     * Validate declared shape before any per-column access. Empty attr_nums
-     * keeps the zero-attribute NULL sentinel handled at fetch time. Ignore
-     * columns_count == 0 (DDL) to support callers passing a placeholder
-     * column list since clickhouse_query() requires one syntactically.
-     */
-    if (query->tupdesc && query->attr_nums && cursor->columns_count > 0 &&
-        (size_t)list_length(query->attr_nums) != cursor->columns_count) {
-        ereport(
-            ERROR,
-            errcode(ERRCODE_DATATYPE_MISMATCH),
-            errmsg_internal(
-                "pg_clickhouse: returned %lu columns, expected %lu",
-                (unsigned long)cursor->columns_count,
-                (unsigned long)list_length(query->attr_nums)
-            ),
-            errdetail_internal("Remote Query: %.64000s", query->sql)
-        );
-    }
-
-    /*
-     * CH JSON columns default to JSONBOID in state->coltypes. When foreign
-     * table column is declared `json` (JSONOID), override so
-     * binary_make_datum returns json Datum from CH's STRING bytes, skipping
-     * jsonb_in / jsonb_out round-trip that would reformat CH's emit and break
-     * expected outputs that pin CH's exact formatting.
-     */
-    if (query->tupdesc && state->coltypes) {
-        ListCell* lc;
-        size_t j = 0;
-
-        foreach (lc, query->attr_nums) {
-            int i = lfirst_int(lc);
-
-            if (state->coltypes[j] == JSONBOID &&
-                TupleDescAttr(query->tupdesc, i - 1)->atttypid == JSONOID) {
-                state->coltypes[j] = JSONOID;
-            }
-            j++;
-        }
-    }
+    configure_native_cursor(cursor, query);
 
     MemoryContextSwitchTo(oldcxt);
 
     if (state->error) {
-        /* Prefer consistent interrupt error message when query interrupted */
-        CHECK_FOR_INTERRUPTS();
-        ereport(
-            ERROR,
-            errcode(ERRCODE_SQL_ROUTINE_EXCEPTION),
-            errmsg("pg_clickhouse: %s", state->error),
-            errdetail_internal("Remote Query: %.64000s", query->sql)
-        );
+        native_cursor_raise_error(cursor);
     }
 
     return cursor;
@@ -1169,56 +930,65 @@ build_conversion(ch_cursor* cursor, const ChFdwScanRowContext* ctx) {
     MemoryContextSwitchTo(old);
 }
 
+static void
+configure_native_cursor(ch_cursor* cursor, const ch_query* query) {
+    pgch_reader* state = cursor->read_state;
+
+    if (query->tupdesc && query->attr_nums && cursor->columns_count > 0 &&
+        (size_t)list_length(query->attr_nums) != cursor->columns_count) {
+        ereport(
+            ERROR,
+            errcode(ERRCODE_DATATYPE_MISMATCH),
+            errmsg_internal(
+                "pg_clickhouse: returned %lu columns, expected %lu",
+                (unsigned long)cursor->columns_count,
+                (unsigned long)list_length(query->attr_nums)
+            ),
+            errdetail_internal("Remote Query: %.64000s", query->sql)
+        );
+    }
+
+    /* Preserve JSON text when PostgreSQL destination uses json, not jsonb. */
+    if (query->tupdesc && state->coltypes) {
+        ListCell* lc;
+        size_t j = 0;
+
+        foreach (lc, query->attr_nums) {
+            int i = lfirst_int(lc);
+
+            if (state->coltypes[j] == JSONBOID &&
+                TupleDescAttr(query->tupdesc, i - 1)->atttypid == JSONOID) {
+                state->coltypes[j] = JSONOID;
+            }
+            j++;
+        }
+    }
+}
+
+/* Apply PostgreSQL conversions to fetched Native row. */
 static Datum*
-binary_fetch_row(ChFdwScanRowContext* ctx) {
+apply_binary_row(ChFdwScanRowContext* ctx) {
     ch_cursor* cursor  = ctx->cursor;
     List* attrs        = ctx->retrieved_attrs;
     TupleDesc tupdesc  = ctx->tupdesc;
     Datum* values      = ctx->values;
     bool* nulls        = ctx->nulls;
     pgch_reader* state = cursor->read_state;
-    ErrorContextCallback errcallback;
-
-    errcallback.callback = binary_fetch_row_errcb;
-    errcallback.arg      = (void*)cursor->query;
-    errcallback.previous = error_context_stack;
-    error_context_stack  = &errcallback;
-
-    bool have_data  = pgch_reader_next(state);
-    size_t attcount = list_length(attrs);
-
-    if (state->error) {
-        error_context_stack = errcallback.previous;
-
-        /* Prefer consistent interrupt error message when fetch interrupted */
-        CHECK_FOR_INTERRUPTS();
-        ereport(
-            ERROR,
-            errcode(ERRCODE_SQL_ROUTINE_EXCEPTION),
-            errmsg("pg_clickhouse: %s", state->error),
-            errdetail_internal("Remote Query: %.64000s", cursor->query)
-        );
-    }
-
-    if (!have_data) {
-        error_context_stack = errcallback.previous;
-        return NULL;
-    }
+    size_t attcount    = list_length(attrs);
 
     if (attcount == 0) {
         if (pgch_reader_columns(state) == 1 && state->nulls[0]) {
             nulls[0] = true;
-            goto ok;
-        } else {
-            ereport(
-                ERROR,
-                errcode(ERRCODE_FDW_ERROR),
-                errmsg(
-                    "pg_clickhouse: unexpected state: attributes "
-                    "count == 0 and haven't got NULL in the response"
-                )
-            );
+            return state->values;
         }
+        ereport(
+            ERROR,
+            errcode(ERRCODE_FDW_ERROR),
+            errmsg(
+                "pg_clickhouse: unexpected state: attributes "
+                "count == 0 and haven't got NULL in the response"
+            )
+        );
     } else if (attcount != pgch_reader_columns(state)) {
         ereport(
             ERROR,
@@ -1242,18 +1012,91 @@ binary_fetch_row(ChFdwScanRowContext* ctx) {
         );
     }
 
-ok:
-    error_context_stack = errcallback.previous;
     return state->values;
+}
+
+/* Raise decoder error; read_error hook may convert to cancellation report. */
+static void
+native_cursor_raise_error(ch_cursor* cursor) {
+    pgch_reader* state = cursor->read_state;
+
+    if (cursor->read_error) {
+        cursor->read_error(cursor);
+    }
+    /* Prefer consistent interrupt error message when fetch interrupted */
+    CHECK_FOR_INTERRUPTS();
+    ereport(
+        ERROR,
+        errcode(ERRCODE_SQL_ROUTINE_EXCEPTION),
+        errmsg("pg_clickhouse: %s", state->error),
+        errdetail_internal("Remote Query: %.64000s", cursor->query)
+    );
+}
+
+static Datum*
+native_fetch_row(ChFdwScanRowContext* ctx) {
+    ch_cursor* cursor  = ctx->cursor;
+    pgch_reader* state = cursor->read_state;
+    ErrorContextCallback errcallback;
+    bool have_data;
+    Datum* result;
+
+    errcallback.callback = binary_fetch_row_errcb;
+    errcallback.arg      = (void*)cursor->query;
+    errcallback.previous = error_context_stack;
+    error_context_stack  = &errcallback;
+
+    have_data = pgch_reader_next(state);
+
+    if (state->error) {
+        error_context_stack = errcallback.previous;
+        native_cursor_raise_error(cursor);
+    }
+
+    result = have_data ? apply_binary_row(ctx) : NULL;
+
+    error_context_stack = errcallback.previous;
+    return result;
+}
+
+static void
+http_native_read_error(ch_cursor* cursor) {
+    ch_http_native* h = cursor->query_response;
+
+    if (ch_http_native_canceled(h) || QueryCancelPending || ProcDiePending) {
+        const char* qid_src = ch_http_native_query_id(h);
+        char qid[CH_HTTP_QUERY_ID_LEN];
+
+        qid[0] = '\0';
+        if (qid_src) {
+            memcpy(qid, qid_src, sizeof(qid));
+        }
+        ch_http_native_free(h);
+        if (qid[0]) {
+            kill_query(cursor->conn, qid);
+        }
+        ereport(
+            ERROR,
+            errcode(ERRCODE_SQL_ROUTINE_EXCEPTION),
+            errmsg("pg_clickhouse: query was aborted")
+        );
+    }
 }
 
 static void
 binary_cursor_free(void* c) {
     ch_cursor* cursor = c;
 
-    /* Conversion states live in the context this callback fires for. */
-    pgch_reader_free(cursor->read_state);
+    native_cursor_state_free(cursor);
     ch_binary_response_free(cursor->query_response);
+}
+
+/* Conversion states live in the context this callback fires for. */
+static void
+native_cursor_state_free(void* c) {
+    ch_cursor* cursor = c;
+
+    pgch_reader_free(cursor->read_state);
 }
 
 static void*

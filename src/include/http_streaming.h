@@ -16,22 +16,21 @@ HttpStream*
 ch_http_stream_begin(
     ch_http_connection_t* conn,
     const ch_query* query,
-    int32 fetch_size
+    int32 fetch_size,
+    bool native
 );
-int
-ch_http_stream_pump(HttpStream* stream);
 void
 ch_http_stream_end(HttpStream* stream);
+
+/* Return 0 with out_n 0 at clean EOF, -1 on transport error or cancellation. */
+int
+ch_http_stream_read(HttpStream* stream, void* dst, size_t len, size_t* out_n);
 
 /* accessors — let pglink.c read stream state without seeing the struct */
 char*
 ch_http_stream_buffer(HttpStream* stream);
 size_t
 ch_http_stream_available(HttpStream* stream);
-void
-ch_http_stream_advance(HttpStream* stream, size_t n);
-bool
-ch_http_stream_transfer_done(HttpStream* stream);
 long
 ch_http_stream_status(HttpStream* stream);
 const char*

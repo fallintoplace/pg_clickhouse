@@ -190,16 +190,14 @@ cleanup:
 /*
  * ch_http_simple_query — buffer the full response in memory.
  *
- * Built on top of the streaming driver with an effectively-unbounded
- * fetch_size, so the whole response lands in one batch that we then hand off
- * to the caller as a ch_http_response_t.
+ * fetch_size 0 buffers complete response.
  */
 ch_http_response_t*
 ch_http_simple_query(ch_http_connection_t* conn, const ch_query* query) {
     HttpStream* stream;
     ch_http_response_t* resp;
 
-    stream = ch_http_stream_begin(conn, query, INT32_MAX);
+    stream = ch_http_stream_begin(conn, query, 0, false);
     if (stream == NULL) {
         return NULL;
     }
@@ -239,7 +237,7 @@ ch_http_server_version(ch_http_connection_t* conn, int* major, int* minor, int* 
     /* conn is calloc'd (see ch_http_connect), so version.major == 0 reliably
      * means the version has not been fetched and cached yet. */
     if (conn->version.major == 0) {
-        ch_query query           = { "SELECT version()", 0, NULL, NULL, NULL, NULL };
+        ch_query query           = { .sql = "SELECT version()" };
         ch_http_response_t* resp = ch_http_simple_query(conn, &query);
 
         if (resp != NULL) {

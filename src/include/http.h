@@ -28,18 +28,6 @@ typedef struct ch_http_response_t {
     double total_time;
 } ch_http_response_t;
 
-typedef enum { CH_CONT, CH_EOL, CH_EOF } ch_read_status;
-
-typedef struct {
-    char* data;
-    size_t datalen;
-    size_t curpos;
-    StringInfoData val;
-    bool done;
-    bool is_null; /* set when the parser saw the wire NULL
-                   * marker `\N` for the field just read */
-} ch_http_read_state;
-
 typedef struct {
     StringInfoData sql;
     char* sql_begin;    /* beginning part of constructed sql */
@@ -67,11 +55,6 @@ ch_http_server_version(ch_http_connection_t* conn, int* major, int* minor, int* 
 char*
 ch_http_last_error(void);
 
-/* read */
-void
-ch_http_read_state_init(ch_http_read_state* state, char* data, size_t datalen);
-int
-ch_http_read_next(ch_http_read_state* state, bool is_array);
 void
 ch_http_response_free(ch_http_response_t* resp);
 

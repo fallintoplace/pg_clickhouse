@@ -50,11 +50,14 @@ typedef struct {
     const TupleDesc tupdesc;
     /* The numbers of the attributes in tupdesc that the query selects. */
     const List* attr_nums;
+    const bool raw_result;
     /* List of settings to pass to ClickHouse upon execution. */
     const kv_list* settings;
 } ch_query;
 
 #define new_query(sql, num, vals, tupdesc, attrs)                                      \
-    { sql, num, vals, tupdesc, attrs, chfdw_get_session_settings() }
+    { sql, num, vals, tupdesc, attrs, false, chfdw_get_session_settings() }
+#define new_raw_query(sql)                                                             \
+    { sql, 0, NULL, NULL, NULL, true, chfdw_get_session_settings() }
 
 #endif /* CLICKHOUSE_ENGINE_H */

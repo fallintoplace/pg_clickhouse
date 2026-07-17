@@ -54,9 +54,10 @@ typedef struct ch_cursor {
     double request_time;
     double total_time;
     size_t columns_count;
-    /* for binary, per returned column: conversion state, target attribute */
+    /* for Native readers, per returned column: conversion state, target attribute */
     void** conversion_states;
     int* fill_dest;
+    void (*read_error)(struct ch_cursor*);
 } ch_cursor;
 
 typedef struct ChFdwScanRowContext {

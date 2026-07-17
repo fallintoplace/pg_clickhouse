@@ -366,8 +366,7 @@ ch_get_table_or_server_option(CHFdwRelationInfo* fpinfo, char* name);
 Datum
 clickhouse_raw_query(PG_FUNCTION_ARGS) {
     char* connstring = text_to_cstring(PG_GETARG_TEXT_P(1));
-    ch_query query =
-        new_query(text_to_cstring(PG_GETARG_TEXT_P(0)), 0, NULL, NULL, NULL);
+    ch_query query   = new_raw_query(text_to_cstring(PG_GETARG_TEXT_P(0)));
 
     ch_connection_details* details = connstring_parse(connstring);
     ch_connection conn;

@@ -84,6 +84,8 @@ All notable changes to this project will be documented in this file. It uses the
 *   Coerce array elements in binary driver. `Array(Int32)` to `bigint[]`, or
     `quantilesExactLow()` results into `double precision[]`, no longer fails
     with `could not cast value from integer[] to bigint[]` ([#326]).
+*   Made HTTP driver decode row results from ClickHouse's Native format.
+    `clickhouse_raw_query()` and HTTP inserts keep TabSeparated behavior.
 
 ### 🐞 Bug Fixes
 

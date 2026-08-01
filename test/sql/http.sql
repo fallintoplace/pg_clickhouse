@@ -262,9 +262,8 @@ DROP FOREIGN TABLE ft_bad_fetch;
 DROP SERVER http_bad_fetch;
 
 /*
- * TabSeparated does not escape `[` or `]` in String values, so a value like
- * `[foo]bar` is wire-indistinguishable from a CH array literal. The parser
- * uses the destination Postgres column type to decide.
+ * Native names the column type on the wire, so a String value like `[foo]bar`
+ * stays text instead of reading as a CH array literal.
  */
 SELECT clickhouse_raw_query('CREATE TABLE http_test.t_brk
     (id String, term String) ENGINE = MergeTree ORDER BY id');
@@ -336,8 +335,8 @@ CREATE FOREIGN TABLE ft_bytea (id text, v bytea)
 SELECT id, v, v IS NULL AS is_null, octet_length(v) FROM ft_bytea ORDER BY id;
 
 /*
- * time columns strip the exact ISO epoch date prefix. Shorter values or ones
- * with another prefix route through the input function unchanged.
+ * time columns route String values through the input function unchanged, so
+ * an ISO timestamp is rejected rather than trimmed to its time of day.
  */
 SELECT clickhouse_raw_query('CREATE TABLE http_test.t_timestr
     (id String, v String) ENGINE = MergeTree ORDER BY id');
@@ -353,9 +352,8 @@ SELECT v FROM ft_timestr WHERE id = '3';
 SELECT v FROM ft_timestr WHERE id = '1';
 SELECT v FROM ft_timestr WHERE id = '2';
 
-/* nested arrays via http (TabSeparated): rectangular maps to multi-dim,
- * jagged shapes route through array_in and surface its malformed-literal
- * error -- matching the binary path. */
+/* nested arrays via http: rectangular maps to multi-dim, jagged shapes are
+ * rejected -- matching the binary path. */
 SELECT clickhouse_raw_query('CREATE TABLE http_test.nested_arrays (
     c1 Int8, c2 Array(Array(Int32)), c3 Array(Array(String))
 ) ENGINE = MergeTree PARTITION BY c1 ORDER BY (c1);

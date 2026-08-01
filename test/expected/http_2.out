@@ -839,9 +839,8 @@ WARNING:  option "fetch_size" is deprecated and ignored
 DROP FOREIGN TABLE ft_bad_fetch;
 DROP SERVER http_bad_fetch;
 /*
- * TabSeparated does not escape `[` or `]` in String values, so a value like
- * `[foo]bar` is wire-indistinguishable from a CH array literal. The parser
- * uses the destination Postgres column type to decide.
+ * Native names the column type on the wire, so a String value like `[foo]bar`
+ * stays text instead of reading as a CH array literal.
  */
 SELECT clickhouse_raw_query('CREATE TABLE http_test.t_brk
     (id String, term String) ENGINE = MergeTree ORDER BY id');
@@ -961,8 +960,8 @@ SELECT id, v, v IS NULL AS is_null, octet_length(v) FROM ft_bytea ORDER BY id;
 (4 rows)
 
 /*
- * time columns strip the exact ISO epoch date prefix. Shorter values or ones
- * with another prefix route through the input function unchanged.
+ * time columns route String values through the input function unchanged, so
+ * an ISO timestamp is rejected rather than trimmed to its time of day.
  */
 SELECT clickhouse_raw_query('CREATE TABLE http_test.t_timestr
     (id String, v String) ENGINE = MergeTree ORDER BY id');
@@ -983,18 +982,16 @@ SELECT clickhouse_raw_query('INSERT INTO http_test.t_timestr VALUES
 CREATE FOREIGN TABLE ft_timestr (id text, v time)
     SERVER http_loopback OPTIONS (table_name 't_timestr');
 SELECT v FROM ft_timestr WHERE id = '3';
-    v     
-----------
- 00:00:00
-(1 row)
-
+ERROR:  invalid input syntax for type time: "1970-01-01T00:00:00Z"
+DETAIL:  Remote Query: SELECT v FROM http_test.t_timestr WHERE ((id = '3'))
 SELECT v FROM ft_timestr WHERE id = '1';
 ERROR:  invalid input syntax for type time: "Z"
+DETAIL:  Remote Query: SELECT v FROM http_test.t_timestr WHERE ((id = '1'))
 SELECT v FROM ft_timestr WHERE id = '2';
 ERROR:  invalid input syntax for type time: "xZ"
-/* nested arrays via http (TabSeparated): rectangular maps to multi-dim,
- * jagged shapes route through array_in and surface its malformed-literal
- * error -- matching the binary path. */
+DETAIL:  Remote Query: SELECT v FROM http_test.t_timestr WHERE ((id = '2'))
+/* nested arrays via http: rectangular maps to multi-dim, jagged shapes are
+ * rejected -- matching the binary path. */
 SELECT clickhouse_raw_query('CREATE TABLE http_test.nested_arrays (
     c1 Int8, c2 Array(Array(Int32)), c3 Array(Array(String))
 ) ENGINE = MergeTree PARTITION BY c1 ORDER BY (c1);
@@ -1045,8 +1042,8 @@ SELECT * FROM ft_nested_arrays ORDER BY c1;
 (2 rows)
 
 SELECT * FROM ft_ragged_arrays ORDER BY c1;
-ERROR:  malformed array literal: "{{1,2,3},{4}}"
-DETAIL:  Multidimensional arrays must have sub-arrays with matching dimensions.
+ERROR:  pg_clickhouse: nested arrays must have sub-arrays with matching dimensions
+DETAIL:  Remote Query: SELECT c1, c2 FROM http_test.ragged_arrays ORDER BY c1 ASC NULLS LAST
 -- clickhouse_query: server-based typed rowset over the http driver
 SELECT * FROM clickhouse_query(
     'http_loopback', 'SELECT c1, c3 FROM t1 ORDER BY c1 LIMIT 3'
@@ -1082,11 +1079,12 @@ LINE 1: SELECT * FROM clickhouse_query('http_loopback', 'SELECT 1');
                       ^
 -- fewer columns declared than returned is rejected
 SELECT * FROM clickhouse_query('http_loopback', 'SELECT 1, 2') AS t(x int);
-ERROR:  pg_clickhouse: columns mismatch
-DETAIL:  Number of returned columns does not match expected column count (1).
+ERROR:  pg_clickhouse: returned 2 columns, expected 1
+DETAIL:  Remote Query: SELECT 1, 2
 -- value not coercible to the declared type is rejected
 SELECT * FROM clickhouse_query('http_loopback', 'SELECT ''abc''') AS t(x int);
 ERROR:  invalid input syntax for type integer: "abc"
+DETAIL:  Remote Query: SELECT 'abc'
 -- unknown server is rejected
 SELECT * FROM clickhouse_query('no_such_server', 'SELECT 1') AS t(x int);
 ERROR:  server "no_such_server" does not exist

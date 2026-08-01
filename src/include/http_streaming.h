@@ -13,12 +13,7 @@ typedef struct HttpStream HttpStream;
 
 /* lifecycle */
 HttpStream*
-ch_http_stream_begin(
-    ch_http_connection_t* conn,
-    const ch_query* query,
-    int32 fetch_size,
-    bool native
-);
+ch_http_stream_begin(ch_http_connection_t* conn, const ch_query* query, bool native);
 void
 ch_http_stream_end(HttpStream* stream);
 

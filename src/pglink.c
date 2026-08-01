@@ -48,7 +48,7 @@ http_simple_insert(void* conn, const ch_query* query);
 static void
 http_cursor_free(void*);
 static ch_cursor*
-http_native_cursor(void* conn, const ch_query* query, int32 fetch_size);
+http_native_cursor(void* conn, const ch_query* query);
 static void
 http_native_read_error(ch_cursor* cursor);
 static void
@@ -324,7 +324,7 @@ static ch_cursor*
 http_simple_query(void* conn, const ch_query* query) {
     int attempts = 0;
     if (!query->raw_result) {
-        return http_native_cursor(conn, query, 0);
+        return http_native_cursor(conn, query);
     }
     /*
      * volatile: changed after setjmp (PG_TRY) and read after longjmp
@@ -470,7 +470,7 @@ native_chunks_cancelled(void* ud pg_attribute_unused()) {
 
 /* Create shared-decoder cursor over HTTP Native response. */
 static ch_cursor*
-http_native_cursor(void* conn, const ch_query* query, int32 fetch_size) {
+http_native_cursor(void* conn, const ch_query* query) {
     int attempts = 0;
     /* volatile: modified inside PG_TRY, read after longjmp in PG_CATCH */
     volatile MemoryContext tempcxt = NULL;
@@ -482,7 +482,7 @@ http_native_cursor(void* conn, const ch_query* query, int32 fetch_size) {
     ch_http_set_progress_func(http_progress_callback);
 
 again:
-    stream = ch_http_stream_begin(conn, query, fetch_size, true);
+    stream = ch_http_stream_begin(conn, query, true);
     if (stream == NULL) {
         ereport(
             ERROR,

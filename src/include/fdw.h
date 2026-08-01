@@ -83,11 +83,7 @@ typedef void* (*prepare_insert_method)(
 );
 typedef void (*insert_tuple_method)(void* state, TupleTableSlot* slot);
 typedef void (*finalize_insert_method)(void* state);
-typedef ch_cursor* (*streaming_query_method)(
-    void* conn,
-    const ch_query* query,
-    int32 fetch_size
-);
+typedef ch_cursor* (*streaming_query_method)(void* conn, const ch_query* query);
 typedef bool (*is_broken_method)(const void* conn);
 
 typedef ch_server_version (*server_version_method)(void* conn);
@@ -202,8 +198,6 @@ typedef struct CHFdwRelationInfo {
     ForeignTable* table;
     ForeignServer* server;
     UserMapping* user; /* only set in use_remote_estimate mode */
-
-    int32 fetch_size; /* fetch size for this remote table */
 
     /*
      * Name of the relation while EXPLAINing ForeignScan. It is used for join

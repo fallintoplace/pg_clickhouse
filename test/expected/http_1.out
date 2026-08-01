@@ -68,16 +68,6 @@ CREATE FOREIGN TABLE ft1 (
 	c7 char(10) default 'ft1',
 	c8 text
 ) SERVER http_loopback OPTIONS (table_name 't1');
-CREATE FOREIGN TABLE ft1_stream (
-	c1 int NOT NULL,
-	c2 int NOT NULL,
-	c3 text,
-	c4 date,
-	c5 date,
-	c6 varchar(10),
-	c7 char(10) default 'ft1',
-	c8 text
-) SERVER http_loopback OPTIONS (table_name 't1', fetch_size '100');
 ALTER FOREIGN TABLE ft1 DROP COLUMN c0;
 CREATE FOREIGN TABLE ft2 (
 	c1 int NOT NULL,
@@ -155,27 +145,6 @@ INSERT INTO ft4
 		   'AAA' || to_char(id, 'FM000'),
 		   (id % 2)::bool
 	FROM generate_series(1, 100) id;
--- 15 rows with fetch_size 100 bytes forces multiple streaming batches.
-SELECT c1, c3 FROM ft1_stream WHERE c1 <= 15 ORDER BY c1;
- c1 |  c3   
-----+-------
-  1 | 00001
-  2 | 00002
-  3 | 00003
-  4 | 00004
-  5 | 00005
-  6 | 00006
-  7 | 00007
-  8 | 00008
-  9 | 00009
- 10 | 00010
- 11 | 00011
- 12 | 00012
- 13 | 00013
- 14 | 00014
- 15 | 00015
-(15 rows)
-
 SELECT * FROM ft5 ORDER BY c1 LIMIT 5;
  c1 | c2 |   c3   | c4 
 ----+----+--------+----
@@ -856,60 +825,17 @@ SELECT * FROM bad_name;
 ERROR:  pg_clickhouse: unsupported line ending character in database name
 DETAIL:  Invalid database name: 'http_test
 X-My-Header: 123'
-/* ===== fetch_size option tests ===== */
-/* Server-level fetch_size: set to 0 to disable streaming. */
-CREATE SERVER http_no_stream FOREIGN DATA WRAPPER clickhouse_fdw
-    OPTIONS(dbname 'http_test', driver 'http', fetch_size '0');
-CREATE USER MAPPING FOR CURRENT_USER SERVER http_no_stream;
-CREATE FOREIGN TABLE ft_no_stream (
-    c1 int NOT NULL,
-    c2 int NOT NULL,
-    c3 text
-) SERVER http_no_stream OPTIONS (table_name 't1');
-/* Query with streaming disabled (fetch_size = 0). */
-SELECT c3 FROM ft_no_stream ORDER BY c1 LIMIT 3;
-  c3   
--------
- 00001
- 00002
- 00003
-(3 rows)
-
-/* Table-level fetch_size overrides server-level. */
-CREATE FOREIGN TABLE ft_override_stream (
-    c1 int NOT NULL,
-    c2 int NOT NULL,
-    c3 text
-) SERVER http_no_stream OPTIONS (table_name 't1', fetch_size '100');
-/* Query with table-level streaming override (fetch_size = 100). */
-SELECT c3 FROM ft_override_stream ORDER BY c1 LIMIT 3;
-  c3   
--------
- 00001
- 00002
- 00003
-(3 rows)
-
-/* Default (no fetch_size set) uses streaming — already tested via ft1. */
-SELECT c3 FROM ft1 ORDER BY c1 LIMIT 3;
-  c3   
--------
- 00001
- 00002
- 00003
-(3 rows)
-
-/* Negative fetch_size should be rejected. */
+/* Deprecated fetch_size options warn but remain accepted. */
 CREATE SERVER http_bad_fetch FOREIGN DATA WRAPPER clickhouse_fdw
-    OPTIONS(dbname 'http_test', driver 'http', fetch_size '-1');
-ERROR:  invalid value for option "fetch_size": -1
-HINT:  fetch_size must be greater than or equal to 0
+    OPTIONS(dbname 'http_test', driver 'http', fetch_size '100');
+WARNING:  option "fetch_size" is deprecated and ignored
 CREATE FOREIGN TABLE ft_bad_fetch (
     c1 int NOT NULL,
     c3 text
-) SERVER http_loopback OPTIONS (table_name 't1', fetch_size '-1');
-ERROR:  invalid value for option "fetch_size": -1
-HINT:  fetch_size must be greater than or equal to 0
+) SERVER http_loopback OPTIONS (table_name 't1', fetch_size '100');
+WARNING:  option "fetch_size" is deprecated and ignored
+DROP FOREIGN TABLE ft_bad_fetch;
+DROP SERVER http_bad_fetch;
 /*
  * TabSeparated does not escape `[` or `]` in String values, so a value like
  * `[foo]bar` is wire-indistinguishable from a CH array literal. The parser
@@ -932,20 +858,6 @@ INSERT INTO ft_brk VALUES
     ('5', '[a,b,c]_trailing'),
     ('6', 'leading text [bracketed] trailing');
 SELECT id, term FROM ft_brk ORDER BY id;
- id |               term                
-----+-----------------------------------
- 1  | [abc_def]_ghi.jkl_mno
- 2  | plainstring
- 3  | [just_brackets]
- 4  | []
- 5  | [a,b,c]_trailing
- 6  | leading text [bracketed] trailing
-(6 rows)
-
-/* Streaming path with a small fetch_size forces multi-batch parsing. */
-CREATE FOREIGN TABLE ft_brk_stream (id text, term text)
-    SERVER http_loopback OPTIONS (table_name 't_brk', fetch_size '32');
-SELECT id, term FROM ft_brk_stream ORDER BY id;
  id |               term                
 ----+-----------------------------------
  1  | [abc_def]_ghi.jkl_mno
@@ -1176,11 +1088,6 @@ ERROR:  invalid input syntax for type integer: "abc"
 -- unknown server is rejected
 SELECT * FROM clickhouse_query('no_such_server', 'SELECT 1') AS t(x int);
 ERROR:  server "no_such_server" does not exist
-DROP USER MAPPING FOR CURRENT_USER SERVER http_no_stream;
-DROP SERVER http_no_stream CASCADE;
-NOTICE:  drop cascades to 2 other objects
-DETAIL:  drop cascades to foreign table ft_no_stream
-drop cascades to foreign table ft_override_stream
 /* ===== secure option tests ===== */
 /* All accepted values for the secure option should pass validation. */
 CREATE SERVER http_secure_on FOREIGN DATA WRAPPER clickhouse_fdw
@@ -1237,16 +1144,14 @@ NOTICE:  drop cascades to foreign table bad_name
 DROP SERVER http_loopback2 CASCADE;
 NOTICE:  drop cascades to foreign table ft6
 DROP SERVER http_loopback CASCADE;
-NOTICE:  drop cascades to 15 other objects
+NOTICE:  drop cascades to 13 other objects
 DETAIL:  drop cascades to foreign table ft1
-drop cascades to foreign table ft1_stream
 drop cascades to foreign table ft2
 drop cascades to foreign table ft3
 drop cascades to foreign table ft4
 drop cascades to foreign table ft5
 drop cascades to foreign table ftcopy
 drop cascades to foreign table ft_brk
-drop cascades to foreign table ft_brk_stream
 drop cascades to foreign table ft_brk_mix
 drop cascades to foreign table ft_nullmark
 drop cascades to foreign table ft_bytea

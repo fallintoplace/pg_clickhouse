@@ -86,11 +86,9 @@ All notable changes to this project will be documented in this file. It uses the
     with `could not cast value from integer[] to bigint[]` ([#326]).
 *   HTTP driver now uses ClickHouse's Native format, sharing encode/decode with
     binary driver. `clickhouse_raw_query()` keeps TabSeparated behavior.
-    Native `INSERT` declares column types from PostgreSQL and leaves the
-    conversion to the destination types to ClickHouse, which requires
-    `input_format_native_allow_types_conversion`, on by default since
-    ClickHouse 23.3. The minimum supported ClickHouse version is therefore
-    now 23.3, the 23.x LTS release, in place of 23.
+*   Deprecated `fetch_size`. It is ignored and produces a warning. HTTP driver
+    always streams, handing Native decoder one chunk at a time. Decoded memory
+    is set by block size ClickHouse writes, not by client-side byte count.
 
 ### 🐞 Bug Fixes
 

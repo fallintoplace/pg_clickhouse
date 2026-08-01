@@ -3,8 +3,8 @@
  * http_streaming.c
  *	  Streaming HTTP query driver for pg_clickhouse.
  *
- *	  Uses curl_multi + CURL_WRITEFUNC_PAUSE to receive ClickHouse HTTP
- *	  responses in byte batches, keeping memory proportional to fetch_size.
+ *	  Uses curl_multi + curl_easy_pause to hand ClickHouse HTTP responses to
+ *	  the caller one receive chunk at a time, keeping memory bounded.
  *
  * Copyright (c) 2025-2026, ClickHouse, Inc.
  *
@@ -51,8 +51,7 @@ struct HttpStream {
     char* buf;
     size_t buf_allocated;
     size_t write_pos;
-    int32 fetch_size; /* approximate batch size in bytes */
-    bool native;
+    bool streaming; /* hand out one chunk at a time, else buffer whole body */
     bool paused;
     bool transfer_done;
     char error_buffer[CURL_ERROR_SIZE];
@@ -67,7 +66,7 @@ struct HttpStream {
 
 /* Forward declarations of static helpers */
 static void
-setup_curl(HttpStream* stream, const ch_query* query);
+setup_curl(HttpStream* stream, const ch_query* query, bool native);
 static void
 capture_transfer_info(HttpStream* stream);
 static int
@@ -81,7 +80,7 @@ write_callback(void* contents, size_t size, size_t nmemb, void* userp);
  * ----------------------------------------------------------------
  */
 static void
-setup_curl(HttpStream* stream, const ch_query* query) {
+setup_curl(HttpStream* stream, const ch_query* query, bool native) {
     CURLU* cu = curl_url();
     char temp_buf[512];
 
@@ -104,7 +103,7 @@ setup_curl(HttpStream* stream, const ch_query* query) {
         "output_format_tsv_crlf_end_of_line",
         NULL,
     };
-    const char* const* overridden = stream->native ? native_overridden : tsv_overridden;
+    const char* const* overridden = native ? native_overridden : tsv_overridden;
 
     kv_iter iter = new_kv_iter(query->settings);
     while (kv_iter_next(&iter)) {
@@ -122,7 +121,7 @@ setup_curl(HttpStream* stream, const ch_query* query) {
         );
     }
 
-    if (stream->native) {
+    if (native) {
         int major, minor, patch;
 
         /* Keep SQL unchanged so query parameters work. */
@@ -234,7 +233,7 @@ setup_curl(HttpStream* stream, const ch_query* query) {
 
 /* ----------------------------------------------------------------
  * write_callback — CURL write callback. Appends data to the stream
- * buffer and asks CURL to pause receipt near fetch_size bytes.
+ * buffer and, when streaming, pauses receipt so the caller drains it.
  * ----------------------------------------------------------------
  */
 static size_t
@@ -265,7 +264,7 @@ write_callback(void* contents, size_t size, size_t nmemb, void* userp) {
     self->write_pos += realsize;
     self->buf[self->write_pos] = '\0';
 
-    if (self->fetch_size > 0 && self->write_pos >= (size_t)self->fetch_size) {
+    if (self->streaming) {
         self->paused = true;
         curl_easy_pause(self->curl, CURLPAUSE_RECV);
     }
@@ -311,9 +310,8 @@ pump(HttpStream* stream) {
             stream->transfer_done = true;
         }
 
-        /* fetch_size 0 waits for complete response. */
-        if (stream->paused || stream->transfer_done ||
-            (stream->fetch_size > 0 && stream->write_pos > 0)) {
+        /* Buffered mode waits for complete response. */
+        if (stream->paused || stream->transfer_done) {
             break;
         }
 
@@ -376,12 +374,7 @@ ch_http_stream_next_chunk(void* ud, const void** data, size_t* len, char** error
  * Returns NULL on failure.
  */
 HttpStream*
-ch_http_stream_begin(
-    ch_http_connection_t* conn,
-    const ch_query* query,
-    int32 fetch_size,
-    bool native
-) {
+ch_http_stream_begin(ch_http_connection_t* conn, const ch_query* query, bool native) {
     HttpStream* stream;
     uuid_t id;
 
@@ -390,9 +383,9 @@ ch_http_stream_begin(
         return NULL;
     }
 
-    stream->conn       = conn;
-    stream->fetch_size = fetch_size;
-    stream->native     = native;
+    stream->conn = conn;
+    /* Native responses decode incrementally; other formats want one buffer. */
+    stream->streaming = native;
 
     /* Generate query ID */
     uuid_generate(id);
@@ -416,7 +409,7 @@ ch_http_stream_begin(
     stream->buf_allocated = INITIAL_BUF_SIZE;
     stream->buf[0]        = '\0';
 
-    setup_curl(stream, query);
+    setup_curl(stream, query, native);
 
     /* Create multi handle and kick off the transfer */
     stream->multi = curl_multi_init();
@@ -426,10 +419,12 @@ ch_http_stream_begin(
     curl_multi_add_handle(stream->multi, stream->curl);
 
     pump(stream);
-    if (native && stream->http_status > 0 && stream->http_status != CH_HTTP_STATUS_OK &&
+    /* Error bodies are reported whole, so stop streaming and buffer the rest. */
+    if (stream->streaming && stream->http_status > 0 &&
+        stream->http_status != CH_HTTP_STATUS_OK &&
         stream->http_status != CH_HTTP_STATUS_CANCELED &&
         stream->http_status != CH_HTTP_STATUS_TRANSPORT_ERROR) {
-        stream->fetch_size = 0;
+        stream->streaming = false;
         pump(stream);
     }
 

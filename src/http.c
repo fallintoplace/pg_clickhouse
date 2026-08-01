@@ -188,16 +188,14 @@ cleanup:
 }
 
 /*
- * ch_http_simple_query — buffer the full response in memory.
- *
- * fetch_size 0 buffers complete response.
+ * ch_http_simple_query — buffer the full TabSeparated response in memory.
  */
 ch_http_response_t*
 ch_http_simple_query(ch_http_connection_t* conn, const ch_query* query) {
     HttpStream* stream;
     ch_http_response_t* resp;
 
-    stream = ch_http_stream_begin(conn, query, 0, false);
+    stream = ch_http_stream_begin(conn, query, false);
     if (stream == NULL) {
         return NULL;
     }

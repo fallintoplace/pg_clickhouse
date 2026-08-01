@@ -37,6 +37,12 @@ typedef struct {
 } ch_connection_details;
 
 /*
+ * Polled by a transport while a request is in flight; return true to abort it.
+ * NULL means the request cannot be cancelled.
+ */
+typedef bool (*ch_cancel_check)(void);
+
+/*
  * ch_query an SQL query to execute on ClickHouse.
  */
 typedef struct {

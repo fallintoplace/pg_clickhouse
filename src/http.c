@@ -8,32 +8,17 @@
 #include <http_streaming.h>
 #include <internal.h>
 
-static char curl_error_buffer[CURL_ERROR_SIZE];
-static bool curl_error_happened                 = false;
-static long curl_verbose                        = 0;
-static curl_xferinfo_callback curl_progressfunc = NULL;
-static bool curl_initialized                    = false;
-static char ch_query_id_prefix[5];
+static long curl_verbose     = 0;
+static bool curl_initialized = false;
 
 void
-ch_http_init(int verbose, uint32_t query_id_prefix) {
+ch_http_init(int verbose) {
     curl_verbose = verbose;
-    snprintf(ch_query_id_prefix, 5, "%x", query_id_prefix);
 
     if (!curl_initialized) {
         curl_initialized = true;
         curl_global_init(CURL_GLOBAL_ALL);
     }
-}
-
-void
-ch_http_set_progress_func(curl_xferinfo_callback progressfunc) {
-    curl_progressfunc = progressfunc;
-}
-
-curl_xferinfo_callback
-ch_http_get_progress_func(void) {
-    return curl_progressfunc;
 }
 
 long
@@ -67,24 +52,17 @@ curl_min_tls_version(tls_version v) {
 }
 
 ch_http_connection_t*
-ch_http_connection(ch_connection_details* details) {
-    int n;
-    char* connstring = NULL;
-    size_t len       = 20; /* all symbols from url string + some extra */
-    char *host = details->host, *username = details->username,
-         *password = details->password;
-    int port       = details->port;
+ch_http_connection(ch_connection_details* details, const char** error) {
+    CURLU* cu  = NULL;
+    char* host = details->host;
+    int port   = details->port;
+    char port_buf[12];
 
-    curl_error_happened        = false;
-    ch_http_connection_t* conn = calloc(sizeof(ch_http_connection_t), 1);
+    ch_http_connection_t* conn = calloc(1, sizeof(ch_http_connection_t));
 
+    *error = "out of memory";
     if (!conn) {
-        goto cleanup;
-    }
-
-    conn->curl = curl_easy_init();
-    if (!conn->curl) {
-        goto cleanup;
+        return NULL;
     }
 
     conn->ssl_version = curl_min_tls_version(details->min_tls_version);
@@ -123,66 +101,47 @@ ch_http_connection(ch_connection_details* details) {
         break;
     }
 
-    len += strlen(host) + snprintf(NULL, 0, "%d", port);
+    snprintf(port_buf, sizeof(port_buf), "%d", port);
 
-    if (username) {
-        username = curl_easy_escape(conn->curl, username, 0);
-        if (username == NULL) {
-            goto cleanup;
-        }
-        len += strlen(username);
-    }
-
-    if (password) {
-        password = curl_easy_escape(conn->curl, password, 0);
-        if (password == NULL) {
-            curl_free(username);
-            goto cleanup;
-        }
-        len += strlen(password);
-    }
-
-    connstring = calloc(len, 1);
-    if (!connstring) {
+    cu = curl_url();
+    if (cu == NULL) {
         goto cleanup;
     }
 
-    char* scheme = use_tls ? "https" : "http";
-
-    if (username && password) {
-        n = snprintf(
-            connstring, len, "%s://%s:%s@%s:%d/", scheme, username, password, host, port
-        );
-        curl_free(username);
-        curl_free(password);
-    } else if (username) {
-        n = snprintf(connstring, len, "%s://%s@%s:%d/", scheme, username, host, port);
-        curl_free(username);
-    } else {
-        n = snprintf(connstring, len, "%s://%s:%d/", scheme, host, port);
-    }
-
-    if (n < 0) {
+    /* Credentials go in as components so curl escapes them for us. */
+    *error = "could not build ClickHouse URL";
+    if (curl_url_set(cu, CURLUPART_SCHEME, use_tls ? "https" : "http", 0) !=
+            CURLUE_OK ||
+        curl_url_set(cu, CURLUPART_HOST, host, 0) != CURLUE_OK ||
+        curl_url_set(cu, CURLUPART_PORT, port_buf, 0) != CURLUE_OK ||
+        curl_url_set(cu, CURLUPART_PATH, "/", 0) != CURLUE_OK) {
         goto cleanup;
     }
 
-    conn->base_url = connstring;
+    if (details->username) {
+        if (curl_url_set(cu, CURLUPART_USER, details->username, CURLU_URLENCODE) !=
+            CURLUE_OK) {
+            goto cleanup;
+        }
 
+        if (details->password &&
+            curl_url_set(cu, CURLUPART_PASSWORD, details->password, CURLU_URLENCODE) !=
+                CURLUE_OK) {
+            goto cleanup;
+        }
+    }
+
+    if (curl_url_get(cu, CURLUPART_URL, &conn->base_url, 0) != CURLUE_OK) {
+        goto cleanup;
+    }
+
+    curl_url_cleanup(cu);
     return conn;
 
 cleanup:
-    snprintf(curl_error_buffer, CURL_ERROR_SIZE, "OOM");
-    curl_error_happened = true;
-    if (connstring) {
-        free(connstring);
-    }
-
-    if (conn) {
-        if (conn->dbname) {
-            free(conn->dbname);
-        }
-        free(conn);
-    }
+    curl_url_cleanup(cu);
+    free(conn->dbname);
+    free(conn);
 
     return NULL;
 }
@@ -191,11 +150,15 @@ cleanup:
  * ch_http_simple_query — buffer the full TabSeparated response in memory.
  */
 ch_http_response_t*
-ch_http_simple_query(ch_http_connection_t* conn, const ch_query* query) {
+ch_http_simple_query(
+    ch_http_connection_t* conn,
+    const ch_query* query,
+    ch_cancel_check cancel
+) {
     HttpStream* stream;
     ch_http_response_t* resp;
 
-    stream = ch_http_stream_begin(conn, query, false);
+    stream = ch_http_stream_begin(conn, query, false, cancel);
     if (stream == NULL) {
         return NULL;
     }
@@ -222,22 +185,22 @@ ch_http_simple_query(ch_http_connection_t* conn, const ch_query* query) {
 
 /*
  * Fetches and caches the ClickHouse server version via SELECT version().
- * Writes 0 to all out-params when the version cannot be determined. Caches the
- * result on the connection, so only the first call issues a query.
+ * Returns zeros when the version cannot be determined; a failed lookup counts
+ * as fetched, so it is not retried and its warning is raised once.
  */
-void
-ch_http_server_version(ch_http_connection_t* conn, int* major, int* minor, int* patch) {
-    *major = *minor = *patch = 0;
+ch_server_version
+ch_http_server_version(ch_http_connection_t* conn, ch_cancel_check cancel) {
+    ch_server_version none = { 0, 0, 0 };
+
     if (conn == NULL) {
-        return;
+        return none;
     }
 
-    /* conn is calloc'd (see ch_http_connect), so version.major == 0 reliably
-     * means the version has not been fetched and cached yet. */
-    if (conn->version.major == 0) {
+    if (!conn->version_fetched) {
         ch_query query           = { .sql = "SELECT version()" };
-        ch_http_response_t* resp = ch_http_simple_query(conn, &query);
+        ch_http_response_t* resp = ch_http_simple_query(conn, &query, cancel);
 
+        conn->version_fetched = true;
         if (resp != NULL) {
             if (resp->http_status == CH_HTTP_STATUS_OK && resp->data != NULL) {
                 int parsed, v_tweak;
@@ -266,7 +229,7 @@ ch_http_server_version(ch_http_connection_t* conn, int* major, int* minor, int* 
                 }
                 if (parsed < 2) {
                     /* Version string probably trash; zero out. */
-                    conn->version.major = 0;
+                    conn->version = none;
                 }
             } else if (resp->http_status != CH_HTTP_STATUS_OK) {
                 elog(
@@ -281,27 +244,14 @@ ch_http_server_version(ch_http_connection_t* conn, int* major, int* minor, int* 
         }
     }
 
-    *major = conn->version.major;
-    *minor = conn->version.minor;
-    *patch = conn->version.patch;
+    return conn->version;
 }
 
 void
 ch_http_close(ch_http_connection_t* conn) {
-    free(conn->base_url);
-    if (conn->dbname) {
-        free(conn->dbname);
-    }
-    curl_easy_cleanup(conn->curl);
-}
-
-char*
-ch_http_last_error(void) {
-    if (curl_error_happened) {
-        return curl_error_buffer;
-    }
-
-    return NULL;
+    curl_free(conn->base_url);
+    free(conn->dbname);
+    free(conn);
 }
 
 void

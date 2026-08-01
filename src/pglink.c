@@ -21,6 +21,8 @@
 #include "fdw.h"
 #include "http.h"
 #include "http_streaming.h"
+#include "pg-clickhouse-decode.h"
+#include "pg-clickhouse-encode.h"
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -131,19 +133,10 @@ static libclickhouse_methods binary_methods = {
     .server_version      = binary_server_version,
 };
 
-static int
-http_progress_callback(
-    void* clientp,
-    curl_off_t dltotal,
-    curl_off_t dlnow,
-    curl_off_t ultotal,
-    curl_off_t ulnow
-) {
-    if (ProcDiePending || QueryCancelPending) {
-        return 1;
-    }
-
-    return 0;
+/* ch_cancel_check for the HTTP transport, polled while a request is in flight. */
+static bool
+http_canceled(void) {
+    return QueryCancelPending || ProcDiePending;
 }
 
 static bool
@@ -160,10 +153,11 @@ ch_connection
 chfdw_http_connect(ch_connection_details* details) {
     ch_connection res;
     ch_http_connection_t* conn;
+    const char* error;
 
     if (!initialized) {
         initialized = true;
-        ch_http_init(0, (uint32_t)MyProcPid);
+        ch_http_init(0);
     }
 
     /*
@@ -188,14 +182,8 @@ chfdw_http_connect(ch_connection_details* details) {
         }
     }
 
-    conn = ch_http_connection(details);
+    conn = ch_http_connection(details, &error);
     if (conn == NULL) {
-        char* error = ch_http_last_error();
-
-        if (error == NULL) {
-            error = "undefined";
-        }
-
         ereport(
             ERROR,
             errcode(ERRCODE_SQLCLIENT_UNABLE_TO_ESTABLISH_SQLCONNECTION),
@@ -221,10 +209,7 @@ http_disconnect(void* conn) {
 
 static ch_server_version
 http_server_version(void* conn) {
-    ch_server_version v = { 0, 0, 0 };
-
-    ch_http_server_version((ch_http_connection_t*)conn, &v.major, &v.minor, &v.patch);
-    return v;
+    return ch_http_server_version((ch_http_connection_t*)conn, http_canceled);
 }
 
 /*
@@ -262,8 +247,8 @@ kill_query(void* conn, const char* query_id) {
         NULL
     );
 
-    ch_http_set_progress_func(NULL);
-    resp = ch_http_simple_query(conn, &query);
+    /* Not cancellable: it is the cleanup for a query already cancelled. */
+    resp = ch_http_simple_query(conn, &query, NULL);
     if (resp != NULL) {
         ch_http_response_free(resp);
     }
@@ -336,10 +321,8 @@ http_simple_query(void* conn, const ch_query* query) {
     ch_cursor* cursor;
     ch_http_response_t* resp;
 
-    ch_http_set_progress_func(http_progress_callback);
-
 again:
-    resp = ch_http_simple_query(conn, query);
+    resp = ch_http_simple_query(conn, query, http_canceled);
     if (resp == NULL) {
         ereport(ERROR, errcode(ERRCODE_FDW_OUT_OF_MEMORY), errmsg("out of memory"));
     }
@@ -423,19 +406,20 @@ again:
 
 static void
 http_simple_insert(void* conn, const ch_query* query) {
-    ch_http_response_t* resp = ch_http_simple_query(conn, query);
+    ch_http_response_t* resp = ch_http_simple_query(conn, query, http_canceled);
 
     if (resp == NULL) {
-        char* error = ch_http_last_error();
+        ereport(ERROR, errcode(ERRCODE_FDW_OUT_OF_MEMORY), errmsg("out of memory"));
+    }
 
-        if (error == NULL) {
-            error = "undefined";
-        }
+    if (resp->http_status == CH_HTTP_STATUS_CANCELED) {
+        kill_query(conn, resp->query_id);
+        ch_http_response_free(resp);
 
         ereport(
             ERROR,
-            errcode(ERRCODE_SQLCLIENT_UNABLE_TO_ESTABLISH_SQLCONNECTION),
-            errmsg("pg_clickhouse: communication error: %s", error)
+            errcode(ERRCODE_SQL_ROUTINE_EXCEPTION),
+            errmsg("pg_clickhouse: query was aborted")
         );
     }
 
@@ -465,7 +449,7 @@ http_cursor_free(void* c) {
 /* pgch_chunk_source cancellation poll, checked between reads. */
 static bool
 native_chunks_cancelled(void* ud pg_attribute_unused()) {
-    return QueryCancelPending || ProcDiePending;
+    return http_canceled();
 }
 
 /* Create shared-decoder cursor over HTTP Native response. */
@@ -479,10 +463,8 @@ http_native_cursor(void* conn, const ch_query* query) {
     ch_cursor* cursor;
     pgch_reader* state;
 
-    ch_http_set_progress_func(http_progress_callback);
-
 again:
-    stream = ch_http_stream_begin(conn, query, true);
+    stream = ch_http_stream_begin(conn, query, true, http_canceled);
     if (stream == NULL) {
         ereport(
             ERROR,

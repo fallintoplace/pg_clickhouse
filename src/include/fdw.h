@@ -72,7 +72,6 @@ typedef struct ChFdwScanRowContext {
 typedef void (*disconnect_method)(void* conn);
 typedef void (*check_conn_method)(const char* password, UserMapping* user);
 typedef ch_cursor* (*simple_query_method)(void* conn, const ch_query* query);
-typedef void (*simple_insert_method)(void* conn, const ch_query* query);
 typedef Datum* (*cursor_fetch_row_method)(ChFdwScanRowContext* ctx);
 typedef void* (*prepare_insert_method)(
     void* conn,

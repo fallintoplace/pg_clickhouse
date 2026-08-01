@@ -4,6 +4,7 @@
 #include "postgres.h"
 
 #include "engine.h"
+#include "server_version.h"
 #include <curl/curl.h>
 
 #define CH_HTTP_QUERY_ID_LEN 37
@@ -27,23 +28,26 @@ typedef struct ch_http_response_t {
 } ch_http_response_t;
 
 void
-ch_http_init(int verbose, uint32_t query_id_prefix);
-void
-ch_http_set_progress_func(curl_xferinfo_callback progressfunc);
-curl_xferinfo_callback
-ch_http_get_progress_func(void);
+ch_http_init(int verbose);
 long
 ch_http_get_verbose(void);
+/* Returns NULL and sets *error to a static message on failure. */
 ch_http_connection_t*
-ch_http_connection(ch_connection_details* details);
+ch_http_connection(ch_connection_details* details, const char** error);
 void
 ch_http_close(ch_http_connection_t* conn);
 ch_http_response_t*
-ch_http_simple_query(ch_http_connection_t* conn, const ch_query* query);
-void
-ch_http_server_version(ch_http_connection_t* conn, int* major, int* minor, int* patch);
-char*
-ch_http_last_error(void);
+ch_http_simple_query(
+    ch_http_connection_t* conn,
+    const ch_query* query,
+    ch_cancel_check cancel
+);
+/*
+ * Fetch and cache the server version, returning {0, 0, 0} when it cannot be
+ * determined. Only the first call issues a query.
+ */
+ch_server_version
+ch_http_server_version(ch_http_connection_t* conn, ch_cancel_check cancel);
 
 void
 ch_http_response_free(ch_http_response_t* resp);

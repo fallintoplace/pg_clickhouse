@@ -54,6 +54,7 @@ struct HttpStream {
     bool streaming; /* hand out one chunk at a time, else buffer whole body */
     bool paused;
     bool transfer_done;
+    ch_cancel_check cancel; /* NULL leaves the transfer uninterruptible */
     char error_buffer[CURL_ERROR_SIZE];
 
     /* Public state readable via C accessors */
@@ -73,6 +74,20 @@ static int
 pump(HttpStream* stream);
 static size_t
 write_callback(void* contents, size_t size, size_t nmemb, void* userp);
+
+/* CURLOPT_XFERINFOFUNCTION adapter over the caller's cancellation check. */
+static int
+xferinfo_callback(
+    void* clientp,
+    curl_off_t dltotal,
+    curl_off_t dlnow,
+    curl_off_t ultotal,
+    curl_off_t ulnow
+) {
+    HttpStream* stream = (HttpStream*)clientp;
+
+    return stream->cancel() ? 1 : 0;
+}
 
 /* ----------------------------------------------------------------
  * setup_curl — configure the CURL easy handle for this query.
@@ -122,7 +137,7 @@ setup_curl(HttpStream* stream, const ch_query* query, bool native) {
     }
 
     if (native) {
-        int major, minor, patch;
+        ch_server_version version;
 
         /* Keep SQL unchanged so query parameters work. */
         curl_url_set(
@@ -132,10 +147,10 @@ setup_curl(HttpStream* stream, const ch_query* query, bool native) {
             CURLU_APPENDQUERY | CURLU_URLENCODE
         );
 
-        ch_http_server_version(stream->conn, &major, &minor, &patch);
+        version = ch_http_server_version(stream->conn, stream->cancel);
 
         /* Gate settings by server version, unknown HTTP settings fail queries. */
-        if (major > 24 || (major == 24 && minor >= 7)) {
+        if (chfdw_version_ge(version, 24, 7)) {
             curl_url_set(
                 cu,
                 CURLUPART_QUERY,
@@ -143,7 +158,7 @@ setup_curl(HttpStream* stream, const ch_query* query, bool native) {
                 CURLU_APPENDQUERY | CURLU_URLENCODE
             );
         }
-        if (major > 24 || (major == 24 && minor >= 10)) {
+        if (chfdw_version_ge(version, 24, 10)) {
             curl_url_set(
                 cu,
                 CURLUPART_QUERY,
@@ -187,12 +202,10 @@ setup_curl(HttpStream* stream, const ch_query* query, bool native) {
         curl_easy_setopt(stream->curl, CURLOPT_SSLVERSION, stream->conn->ssl_version);
     }
 
-    if (ch_http_get_progress_func()) {
+    if (stream->cancel) {
         curl_easy_setopt(stream->curl, CURLOPT_NOPROGRESS, 0L);
-        curl_easy_setopt(
-            stream->curl, CURLOPT_XFERINFOFUNCTION, ch_http_get_progress_func()
-        );
-        curl_easy_setopt(stream->curl, CURLOPT_XFERINFODATA, stream->conn);
+        curl_easy_setopt(stream->curl, CURLOPT_XFERINFOFUNCTION, xferinfo_callback);
+        curl_easy_setopt(stream->curl, CURLOPT_XFERINFODATA, stream);
     } else {
         curl_easy_setopt(stream->curl, CURLOPT_NOPROGRESS, 1L);
     }
@@ -374,7 +387,12 @@ ch_http_stream_next_chunk(void* ud, const void** data, size_t* len, char** error
  * Returns NULL on failure.
  */
 HttpStream*
-ch_http_stream_begin(ch_http_connection_t* conn, const ch_query* query, bool native) {
+ch_http_stream_begin(
+    ch_http_connection_t* conn,
+    const ch_query* query,
+    bool native,
+    ch_cancel_check cancel
+) {
     HttpStream* stream;
     uuid_t id;
 
@@ -383,7 +401,8 @@ ch_http_stream_begin(ch_http_connection_t* conn, const ch_query* query, bool nat
         return NULL;
     }
 
-    stream->conn = conn;
+    stream->conn   = conn;
+    stream->cancel = cancel;
     /* Native responses decode incrementally; other formats want one buffer. */
     stream->streaming = native;
 
@@ -392,9 +411,8 @@ ch_http_stream_begin(ch_http_connection_t* conn, const ch_query* query, bool nat
     uuid_unparse(id, stream->query_id);
 
     /*
-     * Create our own CURL easy handle so that multiple HttpStream instances
-     * (e.g. concurrent foreign scans in subqueries or joins) do not fight
-     * over the single handle in conn->curl.
+     * Each HttpStream owns its easy handle, so concurrent foreign scans in
+     * subqueries or joins do not fight over one.
      */
     stream->curl = curl_easy_init();
     if (!stream->curl) {

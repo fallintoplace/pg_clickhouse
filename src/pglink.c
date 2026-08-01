@@ -9,6 +9,7 @@
 #include "parser/parse_coerce.h"
 #include "parser/parse_type.h"
 #include "utils/builtins.h"
+#include "utils/date.h"
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
@@ -27,6 +28,17 @@
 #include <unistd.h>
 
 static bool initialized = false;
+
+/* Rows buffered for one Native INSERT over HTTP. */
+typedef struct {
+    char* sql;       /* INSERT statement, for error reporting */
+    char* sql_begin; /* sql plus the FORMAT clause the body follows */
+    pgch_writer* writer;
+    AttrNumber* attnums; /* slot attribute feeding each column */
+    Oid* atttypids;
+    size_t ncols;
+    ch_http_connection_t* conn;
+} ch_http_insert_state;
 
 static void
 http_disconnect(void* conn);
@@ -622,58 +634,31 @@ chfdw_datum_to_ch_literal(Datum value, Oid type) {
 }
 
 /*
- * extend_insert_query
- *		Construct values part of INSERT query
+ * Serialize buffered rows as a Native block and POST them.
+ *
+ * Column types come from PostgreSQL, so they rarely match the destination
+ * exactly. ClickHouse casts them per column name under
+ * input_format_native_allow_types_conversion, on by default since 23.3.
  */
 static void
-extend_insert_query(ch_http_insert_state* state, TupleTableSlot* slot) {
-#ifdef USE_ASSERT_CHECKING
-    int pindex = 0;
-#endif
-    bool first = true;
+http_flush_insert(ch_http_insert_state* state) {
+    /* HTTP Native omits block info and custom serialization, as the reader
+     * in ch_http_native_begin expects. */
+    static const chc_block_opts opts = { .has_block_info           = false,
+                                         .has_custom_serialization = false };
+    pgch_buf body                    = {};
 
-    if (state->sql.len == 0) {
-        appendStringInfoString(&state->sql, state->sql_begin);
+    if (pgch_writer_rows(state->writer) == 0) {
+        return;
     }
 
-    /* get following parameters from slot */
-    if (slot != NULL && state->target_attrs != NIL) {
-        ListCell* lc;
+    pgch_buf_append(&body, state->sql_begin, strlen(state->sql_begin));
+    pgch_writer_flush(state->writer, &body, &opts);
 
-        foreach (lc, state->target_attrs) {
-            int attnum = lfirst_int(lc);
-            Datum value;
-            Oid type;
-            bool isnull;
-            char* string;
+    ch_query query = new_body_query(state->sql, body.data, body.len);
 
-            value = slot_getattr(slot, attnum, &isnull);
-            type  = TupleDescAttr(slot->tts_tupleDescriptor, attnum - 1)->atttypid;
-
-            if (!first) {
-                appendStringInfoChar(&state->sql, '\t');
-            }
-            first = false;
-
-            if (isnull) {
-                appendStringInfoString(&state->sql, "\\N");
-#ifdef USE_ASSERT_CHECKING
-                pindex++;
-#endif
-                continue;
-            }
-
-            string = chfdw_datum_to_ch_literal(value, type);
-            appendStringInfoString(&state->sql, string);
-            pfree(string);
-#ifdef USE_ASSERT_CHECKING
-            pindex++;
-#endif
-        }
-        appendStringInfoChar(&state->sql, '\n');
-
-        Assert(pindex == state->p_nums);
-    }
+    http_simple_insert(state->conn, &query);
+    pgch_buf_reset(&body);
 }
 
 static void*
@@ -685,12 +670,75 @@ http_prepare_insert(
     char* table_name
 ) {
     ch_http_insert_state* state = palloc0(sizeof(ch_http_insert_state));
+    Relation rel                = rri->ri_RelationDesc;
+    TupleDesc tupdesc           = RelationGetDescr(rel);
+    Oid relid                   = RelationGetRelid(rel);
+    size_t ncols                = list_length(target_attrs);
+    pgch_col* cols              = palloc0(ncols * sizeof(pgch_col));
+    ListCell* lc;
+    size_t i = 0;
 
-    initStringInfo(&state->sql);
-    state->sql_begin    = psprintf("%s FORMAT TSV\n", query->sql);
-    state->target_attrs = target_attrs;
-    state->p_nums       = list_length(state->target_attrs);
-    state->conn         = conn;
+    state->ncols     = ncols;
+    state->attnums   = palloc0(ncols * sizeof(AttrNumber));
+    state->atttypids = palloc0(ncols * sizeof(Oid));
+
+    foreach (lc, target_attrs) {
+        AttrNumber attnum       = lfirst_int(lc);
+        Form_pg_attribute attr  = TupleDescAttr(tupdesc, attnum - 1);
+        CustomColumnInfo* cinfo = chfdw_get_custom_column_info(relid, attnum);
+        /* Name must match the INSERT column list chfdw_deparse_insert_sql built */
+        const char* colname =
+            (cinfo && cinfo->colname[0]) ? cinfo->colname : NameStr(attr->attname);
+        const char* chtype;
+        chc_err err = {};
+        chc_type* coltype;
+
+        /*
+         * ClickHouse gained Time64 in 25.6 and casts it to none of the types
+         * a table holds a time of day in, so send a timestamp on the epoch
+         * date, as the TabSeparated payload did.
+         */
+        if (attr->atttypid == TIMEOID) {
+            chtype = attr->attnotnull ? "DateTime64(6, 'UTC')"
+                                      : "Nullable(DateTime64(6, 'UTC'))";
+        } else {
+            chtype = pgch_ch_type_for(
+                attr->atttypid, attr->atttypmod, attr->attnotnull, NULL
+            );
+        }
+
+        /* A PostgreSQL array type carries no dimension count, only the
+         * declared attndims does, and ClickHouse nests one Array per
+         * dimension */
+        for (int dim = 1; dim < attr->attndims; dim++) {
+            chtype = psprintf("Array(%s)", chtype);
+        }
+
+        if (chc_type_parse(chtype, strlen(chtype), &pgch_alloc, &coltype, &err) !=
+            CHC_OK) {
+            ereport(
+                ERROR,
+                errcode(ERRCODE_FDW_INVALID_DATA_TYPE),
+                errmsg(
+                    "pg_clickhouse: could not build ClickHouse type for column \"%s\"",
+                    colname
+                ),
+                errdetail_internal("%s: %s", chtype, err.msg)
+            );
+        }
+
+        state->attnums[i]   = attnum;
+        state->atttypids[i] = attr->atttypid;
+        cols[i].name        = colname;
+        cols[i].name_len    = strlen(colname);
+        cols[i].type        = coltype;
+        i++;
+    }
+
+    state->writer    = pgch_writer_new(CurrentMemoryContext, cols, ncols);
+    state->sql       = pstrdup(query->sql);
+    state->sql_begin = psprintf("%s FORMAT Native\n", query->sql);
+    state->conn      = conn;
 
     return state;
 }
@@ -699,15 +747,37 @@ static void
 http_insert_tuple(void* istate, TupleTableSlot* slot) {
     ch_http_insert_state* state = istate;
 
-    extend_insert_query(state, slot);
+    if (slot != NULL) {
+        for (size_t i = 0; i < state->ncols; i++) {
+            bool isnull;
+            Datum value = slot_getattr(slot, state->attnums[i], &isnull);
+            Oid valtype = state->atttypids[i];
 
-    if ((slot == NULL && state->sql.len > 0) ||
-        (size_t)state->sql.len > (MaxAllocSize / 2 /* 512MB */)) {
-        ch_query query = new_query(state->sql.data, 0, NULL, NULL, NULL);
+            /* PostgreSQL casts inet to text through network_show, which
+             * appends a netmask ClickHouse rejects for IPv4 and IPv6. The
+             * output function omits it for single hosts. */
+            if (valtype == INETOID && !isnull) {
+                value   = CStringGetTextDatum(OidOutputFunctionCall(F_INET_OUT, value));
+                valtype = TEXTOID;
+            } else if (valtype == TIMEOID && !isnull) {
+                /* Pair with the DateTime64 column http_prepare_insert declares */
+                value = TimestampTzGetDatum(
+                    DatumGetTimeADT(value) -
+                    (TimestampTz)(POSTGRES_EPOCH_JDATE - UNIX_EPOCH_JDATE) *
+                        USECS_PER_DAY
+                );
+                valtype = TIMESTAMPTZOID;
+            }
 
-        http_simple_insert(state->conn, &query);
-        resetStringInfo(&state->sql);
+            pgch_append_datum(state->writer, i, value, valtype, isnull);
+        }
+
+        /* Flush at 64MiB so bulk loads stream instead of buffering every row */
+        if (pgch_writer_bytes(state->writer) < 64 * 1024 * 1024) {
+            return;
+        }
     }
+    http_flush_insert(state);
 }
 
 /*** BINARY PROTOCOL ***/

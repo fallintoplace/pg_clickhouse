@@ -53,11 +53,16 @@ typedef struct {
     const bool raw_result;
     /* List of settings to pass to ClickHouse upon execution. */
     const kv_list* settings;
+    /* Posted verbatim, already prefixed with sql; sql stays set for errors. */
+    const void* body;
+    const size_t body_len;
 } ch_query;
 
 #define new_query(sql, num, vals, tupdesc, attrs)                                      \
     { sql, num, vals, tupdesc, attrs, false, chfdw_get_session_settings() }
 #define new_raw_query(sql)                                                             \
     { sql, 0, NULL, NULL, NULL, true, chfdw_get_session_settings() }
+#define new_body_query(sql, body, len)                                                 \
+    { sql, 0, NULL, NULL, NULL, false, chfdw_get_session_settings(), body, len }
 
 #endif /* CLICKHOUSE_ENGINE_H */

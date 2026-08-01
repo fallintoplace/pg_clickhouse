@@ -4,8 +4,6 @@
 #include "postgres.h"
 
 #include "engine.h"
-#include "lib/stringinfo.h"
-#include "nodes/pg_list.h"
 #include <curl/curl.h>
 
 #define CH_HTTP_QUERY_ID_LEN 37
@@ -27,14 +25,6 @@ typedef struct ch_http_response_t {
     double pretransfer_time;
     double total_time;
 } ch_http_response_t;
-
-typedef struct {
-    StringInfoData sql;
-    char* sql_begin;    /* beginning part of constructed sql */
-    List* target_attrs; /* list of target attribute numbers */
-    int p_nums;         /* number of parameters to transmit */
-    ch_http_connection_t* conn;
-} ch_http_insert_state;
 
 void
 ch_http_init(int verbose, uint32_t query_id_prefix);

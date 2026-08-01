@@ -84,8 +84,13 @@ All notable changes to this project will be documented in this file. It uses the
 *   Coerce array elements in binary driver. `Array(Int32)` to `bigint[]`, or
     `quantilesExactLow()` results into `double precision[]`, no longer fails
     with `could not cast value from integer[] to bigint[]` ([#326]).
-*   Made HTTP driver decode row results from ClickHouse's Native format.
-    `clickhouse_raw_query()` and HTTP inserts keep TabSeparated behavior.
+*   HTTP driver now uses ClickHouse's Native format, sharing encode/decode with
+    binary driver. `clickhouse_raw_query()` keeps TabSeparated behavior.
+    Native `INSERT` declares column types from PostgreSQL and leaves the
+    conversion to the destination types to ClickHouse, which requires
+    `input_format_native_allow_types_conversion`, on by default since
+    ClickHouse 23.3. The minimum supported ClickHouse version is therefore
+    now 23.3, the 23.x LTS release, in place of 23.
 
 ### 🐞 Bug Fixes
 

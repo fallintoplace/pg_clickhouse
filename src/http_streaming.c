@@ -208,7 +208,12 @@ setup_curl(HttpStream* stream, const ch_query* query) {
     }
 
     /* POST body or MIME form */
-    if (query->num_params == 0) {
+    if (query->body != NULL) {
+        curl_easy_setopt(
+            stream->curl, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)query->body_len
+        );
+        curl_easy_setopt(stream->curl, CURLOPT_POSTFIELDS, query->body);
+    } else if (query->num_params == 0) {
         curl_easy_setopt(stream->curl, CURLOPT_POSTFIELDS, query->sql);
     } else {
         curl_mimepart* part;

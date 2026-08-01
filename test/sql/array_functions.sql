@@ -1,9 +1,12 @@
 CREATE SERVER arr_svr FOREIGN DATA WRAPPER clickhouse_fdw OPTIONS(dbname 'arr_test');
 CREATE USER MAPPING FOR CURRENT_USER SERVER arr_svr;
 
-SELECT clickhouse_raw_query('DROP DATABASE IF EXISTS arr_test');
-SELECT clickhouse_raw_query('CREATE DATABASE arr_test');
-SELECT clickhouse_raw_query($$
+CREATE SERVER arr_admin FOREIGN DATA WRAPPER clickhouse_fdw;
+CREATE USER MAPPING FOR CURRENT_USER SERVER arr_admin;
+
+CALL clickhouse_perform('arr_admin', 'DROP DATABASE IF EXISTS arr_test');
+CALL clickhouse_perform('arr_admin', 'CREATE DATABASE arr_test');
+CALL clickhouse_perform('arr_admin', $$
     CREATE TABLE arr_test.t1 (
         id   Int32,
         vals Array(Int32),
@@ -11,7 +14,7 @@ SELECT clickhouse_raw_query($$
         list String
     ) ENGINE = MergeTree ORDER BY id
 $$);
-SELECT clickhouse_raw_query($$
+CALL clickhouse_perform('arr_admin', $$
     INSERT INTO arr_test.t1 VALUES
         (1, [10,20,30], ['a','b','c'], 'aa-bb-cc'),
         (2, [40,50],    ['d','e'], 'x//z'),
@@ -40,7 +43,7 @@ SELECT * FROM t1 WHERE array_remove(vals, 20) = ARRAY[10,30];
 -- Use a DO block to test arrayRemove on 26+ only.
 DO $$
 DECLARE
-	chv int[] := regexp_matches(clickhouse_raw_query('SELECT version()'), '^(\d+)\.(\d+)')::int[];
+	chv int[] := regexp_matches(clickhouse_server_version('arr_svr'), '^(\d+)\.(\d+)')::int[];
     result record;
 BEGIN
     IF chv[1] >= 26 THEN
@@ -253,5 +256,5 @@ EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM t1 WHERE array_fill(7, ARRAY[2], vals
 EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM t1 WHERE string_to_array(list, '/', 'nil') = ARRAY['x','','z'];
 
 DROP USER MAPPING FOR CURRENT_USER SERVER arr_svr;
-SELECT clickhouse_raw_query('DROP DATABASE arr_test');
+CALL clickhouse_perform('arr_admin', 'DROP DATABASE arr_test');
 DROP SERVER arr_svr CASCADE;

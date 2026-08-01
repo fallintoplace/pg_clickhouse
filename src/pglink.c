@@ -980,11 +980,9 @@ binary_simple_query(void* conn, const ch_query* query) {
 
     /*
      * Validate declared shape before any per-column access. Empty attr_nums
-     * keeps the zero-attribute NULL sentinel handled at fetch time. Ignore
-     * columns_count == 0 (DDL) to support callers passing a placeholder
-     * column list since clickhouse_query() requires one syntactically.
+     * keeps the zero-attribute NULL sentinel handled at fetch time.
      */
-    if (query->tupdesc && query->attr_nums && cursor->columns_count > 0 &&
+    if (query->tupdesc && query->attr_nums &&
         (size_t)list_length(query->attr_nums) != cursor->columns_count) {
         ereport(
             ERROR,

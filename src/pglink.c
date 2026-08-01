@@ -18,6 +18,7 @@
 #include "utils/uuid.h"
 
 #include "binary.h"
+#include "cursor.h"
 #include "fdw.h"
 #include "http.h"
 #include "http_streaming.h"
@@ -51,20 +52,6 @@ static ch_cursor*
 http_native_cursor(void* conn, const ch_query* query);
 static void
 http_native_read_error(ch_cursor* cursor);
-static void
-http_native_cursor_free(void*);
-static void
-native_cursor_state_free(void*);
-static void
-native_cursor_raise_error(ch_cursor* cursor);
-static Datum*
-apply_binary_row(ChFdwScanRowContext* ctx);
-static Datum*
-native_fetch_row(ChFdwScanRowContext* ctx);
-static void
-binary_fetch_row_errcb(void* arg);
-static void
-configure_native_cursor(ch_cursor* cursor, const ch_query* query);
 static void*
 http_prepare_insert(void*, ResultRelInfo*, List*, const ch_query*, char*);
 static void
@@ -78,11 +65,11 @@ static libclickhouse_methods http_methods = {
     .disconnect          = http_disconnect,
     .simple_query        = http_native_cursor,
     .raw_query           = http_raw_query,
-    .fetch_row           = native_fetch_row,
+    .fetch_row           = chfdw_cursor_fetch_row,
     .prepare_insert      = http_prepare_insert,
     .insert_tuple        = http_insert_tuple,
     .streaming_query     = http_native_cursor,
-    .streaming_fetch_row = native_fetch_row,
+    .streaming_fetch_row = chfdw_cursor_fetch_row,
     .server_version      = http_server_version,
 };
 
@@ -92,8 +79,6 @@ static ch_cursor*
 binary_simple_query(void* conn, const ch_query* query);
 static text*
 binary_raw_query(void* conn, const ch_query* query);
-static void
-binary_cursor_free(void* cursor);
 static bool
 binary_is_broken(const void* conn);
 
@@ -125,7 +110,7 @@ static libclickhouse_methods binary_methods = {
     .disconnect          = binary_disconnect,
     .simple_query        = binary_simple_query,
     .raw_query           = binary_raw_query,
-    .fetch_row           = native_fetch_row,
+    .fetch_row           = chfdw_cursor_fetch_row,
     .prepare_insert      = binary_prepare_insert,
     .insert_tuple        = binary_insert_tuple,
     .finalize_insert     = binary_finalize_insert,
@@ -442,16 +427,26 @@ native_overrides(void* conn, ch_setting out[NATIVE_OVERRIDES_MAX]) {
     return n;
 }
 
+static void
+http_stream_reader_init(pgch_reader* reader, void* response) {
+    pgch_chunk_source src = { .ud         = response,
+                              .next_chunk = ch_http_stream_next_chunk,
+                              .cancelled  = native_chunks_cancelled };
+
+    pgch_reader_init_chunks(reader, &src, NULL);
+}
+
+static void
+http_stream_free(void* response) {
+    ch_http_stream_end(response);
+}
+
 /* Create shared-decoder cursor over HTTP Native response. */
 static ch_cursor*
 http_native_cursor(void* conn, const ch_query* query) {
     int attempts = 0;
-    /* volatile: modified inside PG_TRY, read after longjmp in PG_CATCH */
-    volatile MemoryContext tempcxt = NULL;
-    HttpStream* volatile stream;
-    MemoryContext oldcxt;
+    HttpStream* stream;
     ch_cursor* cursor;
-    pgch_reader* state;
     ch_setting overrides[NATIVE_OVERRIDES_MAX];
     ch_http_request req = { .query         = query,
                             .overrides     = overrides,
@@ -479,57 +474,13 @@ again:
         report_http_stream_query_failure(conn, query, stream);
     }
 
-    PG_TRY();
-    {
-        tempcxt = AllocSetContextCreate(
-            PortalContext, "pg_clickhouse native cursor", ALLOCSET_DEFAULT_SIZES
-        );
-        oldcxt = MemoryContextSwitchTo(tempcxt);
+    ch_cursor_source src = { .response             = stream,
+                             .init_reader          = http_stream_reader_init,
+                             .free_response        = http_stream_free,
+                             .raise_response_error = http_native_read_error };
 
-        cursor               = palloc0(sizeof(ch_cursor));
-        cursor->conn         = conn;
-        cursor->query        = pstrdup(query->sql);
-        cursor->request_time = ch_http_stream_request_time(stream);
-        cursor->total_time   = ch_http_stream_total_time(stream);
-        cursor->read_error   = http_native_read_error;
-        state                = palloc0(sizeof(pgch_reader));
-        cursor->read_state   = state;
-
-        /* Register before taking the stream, so unwinding closes it. */
-        cursor->memcxt        = tempcxt;
-        cursor->callback.func = http_native_cursor_free;
-        cursor->callback.arg  = cursor;
-        MemoryContextRegisterResetCallback(tempcxt, &cursor->callback);
-        cursor->query_response = stream;
-        stream                 = NULL;
-
-        pgch_chunk_source src = { .ud         = cursor->query_response,
-                                  .next_chunk = ch_http_stream_next_chunk,
-                                  .cancelled  = native_chunks_cancelled };
-
-        /* Blocks decode into tempcxt, outliving the per-row context. */
-        pgch_reader_init_chunks(state, &src, NULL);
-        cursor->columns_count = pgch_reader_columns(state);
-
-        MemoryContextSwitchTo(oldcxt);
-    }
-    PG_CATCH();
-    {
-        if (stream) {
-            ch_http_stream_end(stream);
-        }
-        if (tempcxt) {
-            MemoryContextDelete(tempcxt);
-        }
-        PG_RE_THROW();
-    }
-    PG_END_TRY();
-
-    if (state->error) {
-        native_cursor_raise_error(cursor);
-    }
-
-    configure_native_cursor(cursor, query);
+    cursor               = chfdw_cursor_open(conn, query, &src);
+    cursor->request_time = ch_http_stream_request_time(stream);
 
     return cursor;
 }
@@ -782,12 +733,20 @@ binary_server_version(void* conn) {
     return v;
 }
 
+static void
+binary_reader_init(pgch_reader* reader, void* response) {
+    pgch_block_source src = ch_binary_response_block_source(response);
+
+    pgch_reader_init(reader, &src);
+}
+
+static void
+binary_response_free(void* response) {
+    ch_binary_response_free(response);
+}
+
 static ch_cursor*
 binary_simple_query(void* conn, const ch_query* query) {
-    MemoryContext tempcxt, oldcxt;
-    ch_cursor* cursor;
-    pgch_reader* state;
-
     ch_binary_response_t* resp = ch_binary_simple_query(conn, query, &is_canceled);
 
     if (!ch_binary_response_success(resp)) {
@@ -805,121 +764,11 @@ binary_simple_query(void* conn, const ch_query* query) {
         );
     }
 
-    tempcxt = AllocSetContextCreate(
-        PortalContext, "pg_clickhouse cursor", ALLOCSET_DEFAULT_SIZES
-    );
+    ch_cursor_source src = { .response      = resp,
+                             .init_reader   = binary_reader_init,
+                             .free_response = binary_response_free };
 
-    oldcxt                 = MemoryContextSwitchTo(tempcxt);
-    cursor                 = palloc0(sizeof(ch_cursor));
-    cursor->conn           = conn;
-    cursor->query_response = resp;
-    state                  = (pgch_reader*)palloc0(sizeof(pgch_reader));
-    cursor->query          = pstrdup(query->sql);
-    cursor->read_state     = state;
-    pgch_block_source src  = ch_binary_response_block_source(resp);
-    pgch_reader_init(cursor->read_state, &src);
-    cursor->columns_count = pgch_reader_columns(state);
-    cursor->memcxt        = tempcxt;
-    cursor->callback.func = binary_cursor_free;
-    cursor->callback.arg  = cursor;
-    MemoryContextRegisterResetCallback(tempcxt, &cursor->callback);
-
-    configure_native_cursor(cursor, query);
-
-    MemoryContextSwitchTo(oldcxt);
-
-    if (state->error) {
-        native_cursor_raise_error(cursor);
-    }
-
-    return cursor;
-}
-
-/*
- * Escape characters that would otherwise corrupt the tab/newline framing or
- * collide with the \N null marker. Matches CH's TabSeparated escaping; \0 is
- * unreachable since values arrive as cstrings, so it needs no case.
- */
-static void
-append_tsv_escaped(StringInfo buf, const char* s) {
-    for (; *s != '\0'; s++) {
-        switch (*s) {
-        case '\\':
-            appendStringInfoString(buf, "\\\\");
-            break;
-        case '\b':
-            appendStringInfoString(buf, "\\b");
-            break;
-        case '\f':
-            appendStringInfoString(buf, "\\f");
-            break;
-        case '\n':
-            appendStringInfoString(buf, "\\n");
-            break;
-        case '\r':
-            appendStringInfoString(buf, "\\r");
-            break;
-        case '\t':
-            appendStringInfoString(buf, "\\t");
-            break;
-        default:
-            appendStringInfoChar(buf, *s);
-        }
-    }
-}
-
-/*
- * Drain a Native cursor into tab-separated rows, mirroring the single-text
- * result of the http path. Nulls render as \N, other values escape the
- * control characters CH's TabSeparated format does so they stay unambiguous.
- * Output formatting otherwise differs from the http driver since values pass
- * through PG output functions rather than ClickHouse's wire formatting.
- */
-static text*
-render_native_tsv(ch_cursor* cursor) {
-    pgch_reader* state = cursor->read_state;
-    size_t ncols       = pgch_reader_columns(state);
-    StringInfoData buf;
-
-    if (ncols == 0) {
-        return NULL;
-    }
-
-    initStringInfo(&buf);
-
-    while (pgch_reader_next(state)) {
-        for (size_t i = 0; i < ncols; i++) {
-            if (i > 0) {
-                appendStringInfoChar(&buf, '\t');
-            }
-
-            if (state->nulls[i]) {
-                appendStringInfoString(&buf, "\\N");
-            } else {
-                char* val = pgch_value_to_cstring(state->coltypes[i], state->values[i]);
-
-                append_tsv_escaped(&buf, val);
-                pfree(val);
-            }
-        }
-        appendStringInfoChar(&buf, '\n');
-        CHECK_FOR_INTERRUPTS();
-    }
-
-    if (state->error) {
-        ereport(
-            ERROR,
-            errcode(ERRCODE_SQL_ROUTINE_EXCEPTION),
-            errmsg("pg_clickhouse: %s", state->error)
-        );
-    }
-
-    if (buf.len == 0) {
-        pfree(buf.data);
-        return NULL;
-    }
-
-    return cstring_to_text_with_len(buf.data, buf.len);
+    return chfdw_cursor_open(conn, query, &src);
 }
 
 static text*
@@ -929,7 +778,7 @@ binary_raw_query(void* conn, const ch_query* query) {
     text* volatile result;
 
     PG_TRY();
-    { result = render_native_tsv(cursor); }
+    { result = chfdw_cursor_render_tsv(cursor); }
     PG_FINALLY();
     { MemoryContextDelete(cursor->memcxt); }
     PG_END_TRY();
@@ -937,184 +786,10 @@ binary_raw_query(void* conn, const ch_query* query) {
     return result;
 }
 
-/*
- * Fetch a row from the binary cursor and return its values.
- *
- * If ctx->tupdesc is set, ctx->attinmeta must also be set, and ctx->values
- * and ctx->nulls must already be palloc'd with space for ctx->tupdesc->natts
- * values.
- *
- * Use ctx->tupdesc and ctx->attinmeta to convert the values to the
- * appropriate Datums, and store them and the indication of their NULLness in
- * ctx->values and ctx->nulls, respectively, then return ctx->values.
- *
- * If ctx->tupdesc is not set, treat all values as text and return them as
- * text `Datum`s. This is the use case for `chfdw_construct_create_tables()`,
- * which only cares about text.
- */
-static void
-binary_fetch_row_errcb(void* arg) {
-    const char* sql = (const char*)arg;
-
-    errdetail_internal("Remote Query: %.64000s", sql);
-}
-
-/* Conversion state and target attribute per returned column. */
-static void
-build_conversion(ch_cursor* cursor, const ChFdwScanRowContext* ctx) {
-    pgch_reader* state = cursor->read_state;
-    MemoryContext old  = MemoryContextSwitchTo(cursor->memcxt);
-    size_t ncols       = pgch_reader_columns(state);
-    ListCell* lc;
-    size_t j = 0;
-
-    cursor->conversion_states = palloc0(ncols * sizeof(void*));
-    cursor->fill_dest         = palloc0(ncols * sizeof(int));
-    foreach (lc, ctx->retrieved_attrs) {
-        int attnum            = lfirst_int(lc);
-        Form_pg_attribute att = TupleDescAttr(ctx->tupdesc, attnum - 1);
-
-        cursor->fill_dest[j] = attnum - 1;
-        cursor->conversion_states[j] =
-            pgch_reader_convert_init(state, j, att->atttypid, att->atttypmod);
-        j++;
-    }
-
-    MemoryContextSwitchTo(old);
-}
-
-static void
-configure_native_cursor(ch_cursor* cursor, const ch_query* query) {
-    pgch_reader* state = cursor->read_state;
-
-    if (query->tupdesc && query->attr_nums && cursor->columns_count > 0 &&
-        (size_t)list_length(query->attr_nums) != cursor->columns_count) {
-        ereport(
-            ERROR,
-            errcode(ERRCODE_DATATYPE_MISMATCH),
-            errmsg_internal(
-                "pg_clickhouse: returned %lu columns, expected %lu",
-                (unsigned long)cursor->columns_count,
-                (unsigned long)list_length(query->attr_nums)
-            ),
-            errdetail_internal("Remote Query: %.64000s", query->sql)
-        );
-    }
-
-    /* Preserve JSON text when PostgreSQL destination uses json, not jsonb. */
-    if (query->tupdesc && state->coltypes) {
-        ListCell* lc;
-        size_t j = 0;
-
-        foreach (lc, query->attr_nums) {
-            int i = lfirst_int(lc);
-
-            if (state->coltypes[j] == JSONBOID &&
-                TupleDescAttr(query->tupdesc, i - 1)->atttypid == JSONOID) {
-                state->coltypes[j] = JSONOID;
-            }
-            j++;
-        }
-    }
-}
-
-/* Apply PostgreSQL conversions to fetched Native row. */
-static Datum*
-apply_binary_row(ChFdwScanRowContext* ctx) {
-    ch_cursor* cursor  = ctx->cursor;
-    List* attrs        = ctx->retrieved_attrs;
-    TupleDesc tupdesc  = ctx->tupdesc;
-    Datum* values      = ctx->values;
-    bool* nulls        = ctx->nulls;
-    pgch_reader* state = cursor->read_state;
-    size_t attcount    = list_length(attrs);
-
-    if (attcount == 0) {
-        if (pgch_reader_columns(state) == 1 && state->nulls[0]) {
-            nulls[0] = true;
-            return state->values;
-        }
-        ereport(
-            ERROR,
-            errcode(ERRCODE_FDW_ERROR),
-            errmsg(
-                "pg_clickhouse: unexpected state: attributes "
-                "count == 0 and haven't got NULL in the response"
-            )
-        );
-    } else if (attcount != pgch_reader_columns(state)) {
-        ereport(
-            ERROR,
-            errcode(ERRCODE_DATATYPE_MISMATCH),
-            errmsg_internal(
-                "pg_clickhouse: returned %lu columns, expected %lu",
-                pgch_reader_columns(state),
-                attcount
-            )
-        );
-    }
-
-    if (tupdesc) {
-        Assert(values && nulls);
-
-        if (cursor->conversion_states == NULL) {
-            build_conversion(cursor, ctx);
-        }
-        pgch_reader_fill_map(
-            state, cursor->conversion_states, cursor->fill_dest, values, nulls
-        );
-    }
-
-    return state->values;
-}
-
-/* Raise decoder error; read_error hook may convert to cancellation report. */
-static void
-native_cursor_raise_error(ch_cursor* cursor) {
-    pgch_reader* state = cursor->read_state;
-
-    if (cursor->read_error) {
-        cursor->read_error(cursor);
-    }
-    /* Prefer consistent interrupt error message when fetch interrupted */
-    CHECK_FOR_INTERRUPTS();
-    ereport(
-        ERROR,
-        errcode(ERRCODE_SQL_ROUTINE_EXCEPTION),
-        errmsg("pg_clickhouse: %s", state->error),
-        errdetail_internal("Remote Query: %.64000s", cursor->query)
-    );
-}
-
-static Datum*
-native_fetch_row(ChFdwScanRowContext* ctx) {
-    ch_cursor* cursor  = ctx->cursor;
-    pgch_reader* state = cursor->read_state;
-    ErrorContextCallback errcallback;
-    bool have_data;
-    Datum* result;
-
-    errcallback.callback = binary_fetch_row_errcb;
-    errcallback.arg      = (void*)cursor->query;
-    errcallback.previous = error_context_stack;
-    error_context_stack  = &errcallback;
-
-    have_data = pgch_reader_next(state);
-
-    if (state->error) {
-        error_context_stack = errcallback.previous;
-        native_cursor_raise_error(cursor);
-    }
-
-    result = have_data ? apply_binary_row(ctx) : NULL;
-
-    error_context_stack = errcallback.previous;
-    return result;
-}
-
+/* Report a truncated response as cancellation when that is what caused it. */
 static void
 http_native_read_error(ch_cursor* cursor) {
-    HttpStream* stream = cursor->query_response;
+    HttpStream* stream = cursor->response;
 
     if (stream == NULL) {
         return;
@@ -1127,7 +802,7 @@ http_native_read_error(ch_cursor* cursor) {
         memcpy(qid, ch_http_stream_query_id(stream), sizeof(qid));
         /* Drop the transfer before asking the server to kill the query. */
         ch_http_stream_end(stream);
-        cursor->query_response = NULL;
+        cursor->response = NULL;
         kill_query(cursor->conn, qid);
         ereport(
             ERROR,
@@ -1135,31 +810,6 @@ http_native_read_error(ch_cursor* cursor) {
             errmsg("pg_clickhouse: query was aborted")
         );
     }
-}
-
-static void
-http_native_cursor_free(void* c) {
-    ch_cursor* cursor = c;
-
-    native_cursor_state_free(cursor);
-    ch_http_stream_end(cursor->query_response);
-    cursor->query_response = NULL;
-}
-
-static void
-binary_cursor_free(void* c) {
-    ch_cursor* cursor = c;
-
-    native_cursor_state_free(cursor);
-    ch_binary_response_free(cursor->query_response);
-}
-
-/* Conversion states live in the context this callback fires for. */
-static void
-native_cursor_state_free(void* c) {
-    ch_cursor* cursor = c;
-
-    pgch_reader_free(cursor->read_state);
 }
 
 static void*

@@ -41,24 +41,8 @@
  */
 #define CH_ESCAPED_NAMEDATALEN NAMEDATALEN * 2
 
-/* pglink.c: an open Native result, whichever driver produced it */
+/* cursor.h: an open Native result, whichever driver produced it */
 typedef struct ch_cursor ch_cursor;
-typedef struct ch_cursor {
-    MemoryContext memcxt; /* used for cleanup */
-    MemoryContextCallback callback;
-
-    void* query_response; /* driver response the reader decodes */
-    void* read_state;     /* pgch_reader over query_response */
-    void* conn;
-    char* query;
-    double request_time;
-    double total_time;
-    size_t columns_count;
-    /* per returned column: conversion state, target attribute */
-    void** conversion_states;
-    int* fill_dest;
-    void (*read_error)(struct ch_cursor*);
-} ch_cursor;
 
 typedef struct ChFdwScanRowContext {
     TupleDesc tupdesc;        /* tuple descriptor for row */

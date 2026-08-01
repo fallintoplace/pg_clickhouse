@@ -41,6 +41,7 @@
 #endif
 
 /* extension includes. */
+#include "cursor.h"
 #include "fdw.h"
 #include "utils/builtins.h"
 #include "version.h"

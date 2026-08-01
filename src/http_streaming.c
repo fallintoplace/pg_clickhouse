@@ -67,7 +67,7 @@ struct HttpStream {
 
 /* Forward declarations of static helpers */
 static void
-setup_curl(HttpStream* stream, const ch_query* query, bool native);
+setup_curl(HttpStream* stream, const ch_http_request* req);
 static void
 capture_transfer_info(HttpStream* stream);
 static int
@@ -89,14 +89,26 @@ xferinfo_callback(
     return stream->cancel() ? 1 : 0;
 }
 
+/* True when an override replaces the user setting of this name. */
+static bool
+is_overridden(const ch_http_request* req, const char* name) {
+    for (int i = 0; i < req->num_overrides; i++) {
+        if (strcmp(req->overrides[i].name, name) == 0) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 /* ----------------------------------------------------------------
  * setup_curl — configure the CURL easy handle for this query.
- * Mirrors the setup portion of ch_http_simple_query() in http.c.
  * ----------------------------------------------------------------
  */
 static void
-setup_curl(HttpStream* stream, const ch_query* query, bool native) {
-    CURLU* cu = curl_url();
+setup_curl(HttpStream* stream, const ch_http_request* req) {
+    const ch_query* query = req->query;
+    CURLU* cu             = curl_url();
     char temp_buf[512];
 
     /* Build URL with query_id and settings */
@@ -105,29 +117,9 @@ setup_curl(HttpStream* stream, const ch_query* query, bool native) {
     snprintf(temp_buf, sizeof(temp_buf), "query_id=%s", stream->query_id);
     curl_url_set(cu, CURLUPART_QUERY, temp_buf, CURLU_APPENDQUERY | CURLU_URLENCODE);
 
-    /* Settings overridden below win over user settings. */
-    static const char* const native_overridden[] = {
-        "default_format",
-        "output_format_native_encode_types_in_binary_format",
-        "output_format_native_write_json_as_string",
-        NULL,
-    };
-    static const char* const tsv_overridden[] = {
-        "date_time_output_format",
-        "format_tsv_null_representation",
-        "output_format_tsv_crlf_end_of_line",
-        NULL,
-    };
-    const char* const* overridden = native ? native_overridden : tsv_overridden;
-
     kv_iter iter = new_kv_iter(query->settings);
     while (kv_iter_next(&iter)) {
-        const char* const* skip = overridden;
-
-        while (*skip && strcmp(iter.name, *skip) != 0) {
-            skip++;
-        }
-        if (*skip) {
+        if (is_overridden(req, iter.name)) {
             continue;
         }
         snprintf(temp_buf, sizeof(temp_buf), "%s=%s", iter.name, iter.value);
@@ -136,56 +128,19 @@ setup_curl(HttpStream* stream, const ch_query* query, bool native) {
         );
     }
 
-    if (native) {
-        ch_server_version version;
-
-        /* Keep SQL unchanged so query parameters work. */
-        curl_url_set(
-            cu,
-            CURLUPART_QUERY,
-            "default_format=Native",
-            CURLU_APPENDQUERY | CURLU_URLENCODE
-        );
-
-        version = ch_http_server_version(stream->conn, stream->cancel);
-
-        /* Gate settings by server version, unknown HTTP settings fail queries. */
-        if (chfdw_version_ge(version, 24, 7)) {
-            curl_url_set(
-                cu,
-                CURLUPART_QUERY,
-                "output_format_native_encode_types_in_binary_format=0",
-                CURLU_APPENDQUERY | CURLU_URLENCODE
-            );
-        }
-        if (chfdw_version_ge(version, 24, 10)) {
-            curl_url_set(
-                cu,
-                CURLUPART_QUERY,
-                "output_format_native_write_json_as_string=1",
-                CURLU_APPENDQUERY | CURLU_URLENCODE
-            );
-        }
-    } else {
-        curl_url_set(
-            cu,
-            CURLUPART_QUERY,
-            "date_time_output_format=iso",
-            CURLU_APPENDQUERY | CURLU_URLENCODE
+    for (int i = 0; i < req->num_overrides; i++) {
+        snprintf(
+            temp_buf,
+            sizeof(temp_buf),
+            "%s=%s",
+            req->overrides[i].name,
+            req->overrides[i].value
         );
         curl_url_set(
-            cu,
-            CURLUPART_QUERY,
-            "format_tsv_null_representation=\\N",
-            CURLU_APPENDQUERY | CURLU_URLENCODE
-        );
-        curl_url_set(
-            cu,
-            CURLUPART_QUERY,
-            "output_format_tsv_crlf_end_of_line=0",
-            CURLU_APPENDQUERY | CURLU_URLENCODE
+            cu, CURLUPART_QUERY, temp_buf, CURLU_APPENDQUERY | CURLU_URLENCODE
         );
     }
+
     curl_url_get(cu, CURLUPART_URL, &stream->url, 0);
     curl_url_cleanup(cu);
 
@@ -382,17 +337,23 @@ ch_http_stream_next_chunk(void* ud, const void** data, size_t* len, char** error
  * ----------------------------------------------------------------
  */
 
+/* True for a status whose body the caller reads as an error message. */
+static bool
+error_status(long status) {
+    /* Synthetic statuses carry no server body. */
+    if (status == CH_HTTP_STATUS_CANCELED || status == CH_HTTP_STATUS_TRANSPORT_ERROR) {
+        return false;
+    }
+
+    return status > 0 && status != CH_HTTP_STATUS_OK;
+}
+
 /*
  * ch_http_stream_begin — allocate and initialize a streaming HTTP query.
  * Returns NULL on failure.
  */
 HttpStream*
-ch_http_stream_begin(
-    ch_http_connection_t* conn,
-    const ch_query* query,
-    bool native,
-    ch_cancel_check cancel
-) {
+ch_http_stream_begin(ch_http_connection_t* conn, const ch_http_request* req) {
     HttpStream* stream;
     uuid_t id;
 
@@ -401,10 +362,9 @@ ch_http_stream_begin(
         return NULL;
     }
 
-    stream->conn   = conn;
-    stream->cancel = cancel;
-    /* Native responses decode incrementally; other formats want one buffer. */
-    stream->streaming = native;
+    stream->conn      = conn;
+    stream->cancel    = req->cancel;
+    stream->streaming = req->stream_chunks;
 
     /* Generate query ID */
     uuid_generate(id);
@@ -427,7 +387,7 @@ ch_http_stream_begin(
     stream->buf_allocated = INITIAL_BUF_SIZE;
     stream->buf[0]        = '\0';
 
-    setup_curl(stream, query, native);
+    setup_curl(stream, req);
 
     /* Create multi handle and kick off the transfer */
     stream->multi = curl_multi_init();
@@ -438,10 +398,7 @@ ch_http_stream_begin(
 
     pump(stream);
     /* Error bodies are reported whole, so stop streaming and buffer the rest. */
-    if (stream->streaming && stream->http_status > 0 &&
-        stream->http_status != CH_HTTP_STATUS_OK &&
-        stream->http_status != CH_HTTP_STATUS_CANCELED &&
-        stream->http_status != CH_HTTP_STATUS_TRANSPORT_ERROR) {
+    if (stream->streaming && error_status(stream->http_status)) {
         stream->streaming = false;
         pump(stream);
     }

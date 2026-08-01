@@ -148,6 +148,9 @@ cleanup:
 
 /*
  * ch_http_simple_query — buffer the full TabSeparated response in memory.
+ *
+ * Server default format is TabSeparated, so only its dialect needs pinning:
+ * ISO timestamps, \N for NULL and LF line ends, as the text parsers expect.
  */
 ch_http_response_t*
 ch_http_simple_query(
@@ -155,10 +158,19 @@ ch_http_simple_query(
     const ch_query* query,
     ch_cancel_check cancel
 ) {
+    static const ch_setting tsv_overrides[] = {
+        { "date_time_output_format",            "iso" },
+        { "format_tsv_null_representation",     "\\N" },
+        { "output_format_tsv_crlf_end_of_line", "0"   },
+    };
+    const ch_http_request req = { .query         = query,
+                                  .overrides     = tsv_overrides,
+                                  .num_overrides = lengthof(tsv_overrides),
+                                  .cancel        = cancel };
     HttpStream* stream;
     ch_http_response_t* resp;
 
-    stream = ch_http_stream_begin(conn, query, false, cancel);
+    stream = ch_http_stream_begin(conn, &req);
     if (stream == NULL) {
         return NULL;
     }

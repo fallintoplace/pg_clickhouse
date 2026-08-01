@@ -452,6 +452,34 @@ native_chunks_cancelled(void* ud pg_attribute_unused()) {
     return http_canceled();
 }
 
+/* Room for every setting native_overrides writes. */
+#define NATIVE_OVERRIDES_MAX 3
+
+/*
+ * Settings the shared decoder needs from a Native response: the pair
+ * PGCH_NATIVE_SETTINGS joins, plus the format itself. Listed one by one
+ * because each needs its own server version gate; an unknown HTTP setting
+ * fails the query.
+ */
+static int
+native_overrides(void* conn, ch_setting out[NATIVE_OVERRIDES_MAX]) {
+    ch_server_version version =
+        ch_http_server_version((ch_http_connection_t*)conn, http_canceled);
+    int n = 0;
+
+    /* Format as a setting keeps SQL unchanged, so query parameters work. */
+    out[n++] = (ch_setting){ "default_format", "Native" };
+    if (chfdw_version_ge(version, 24, 7)) {
+        out[n++] =
+            (ch_setting){ "output_format_native_encode_types_in_binary_format", "0" };
+    }
+    if (chfdw_version_ge(version, 24, 10)) {
+        out[n++] = (ch_setting){ "output_format_native_write_json_as_string", "1" };
+    }
+
+    return n;
+}
+
 /* Create shared-decoder cursor over HTTP Native response. */
 static ch_cursor*
 http_native_cursor(void* conn, const ch_query* query) {
@@ -462,9 +490,15 @@ http_native_cursor(void* conn, const ch_query* query) {
     MemoryContext oldcxt;
     ch_cursor* cursor;
     pgch_reader* state;
+    ch_setting overrides[NATIVE_OVERRIDES_MAX];
+    ch_http_request req = { .query         = query,
+                            .overrides     = overrides,
+                            .num_overrides = native_overrides(conn, overrides),
+                            .stream_chunks = true,
+                            .cancel        = http_canceled };
 
 again:
-    stream = ch_http_stream_begin(conn, query, true, http_canceled);
+    stream = ch_http_stream_begin(conn, &req);
     if (stream == NULL) {
         ereport(
             ERROR,

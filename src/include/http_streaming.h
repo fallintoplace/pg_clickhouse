@@ -11,14 +11,29 @@ typedef struct ch_http_connection_t ch_http_connection_t;
  */
 typedef struct HttpStream HttpStream;
 
+/* A ClickHouse setting the caller sends as a URL parameter. */
+typedef struct ch_setting {
+    const char* name;
+    const char* value;
+} ch_setting;
+
+/*
+ * One HTTP request: the SQL to run plus the response policy its caller needs.
+ * Overrides win over a query setting of the same name, so a caller pins what
+ * its decoder requires while user settings fill in the rest.
+ */
+typedef struct ch_http_request {
+    const ch_query* query;
+    const ch_setting* overrides;
+    int num_overrides;
+    /* Hand out the body one receive chunk at a time, else buffer it whole */
+    bool stream_chunks;
+    ch_cancel_check cancel; /* NULL leaves the transfer uninterruptible */
+} ch_http_request;
+
 /* lifecycle */
 HttpStream*
-ch_http_stream_begin(
-    ch_http_connection_t* conn,
-    const ch_query* query,
-    bool native,
-    ch_cancel_check cancel
-);
+ch_http_stream_begin(ch_http_connection_t* conn, const ch_http_request* req);
 void
 ch_http_stream_end(HttpStream* stream);
 

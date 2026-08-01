@@ -33,7 +33,7 @@ CH_C_DIR = $(PGCH_DIR)/clickhouse-c
 PG_CPPFLAGS = -I./src/include -isystem $(CH_C_DIR) -isystem $(PGCH_DIR) -isystem $(shell $(PG_CONFIG) --includedir-server) -DPGCH_MSG_PREFIX='"pg_clickhouse: "'
 
 # Link OpenSSL (for TLS in the binary driver), curl (for the HTTP driver),
-# libuuid (for http_streaming.c's query-id generator), and lz4 / zstd
+# libuuid (for http.c's query-id generator), and lz4 / zstd
 # (for the binary driver's compressed-frame codecs).
 PG_LDFLAGS = -lssl -lcrypto -llz4 -lzstd $(shell $(CURL_CONFIG) --libs)
 

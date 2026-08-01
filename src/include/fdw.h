@@ -261,10 +261,6 @@ extern ch_scan_connection
 chfdw_get_scan_connection(UserMapping* user);
 extern void
 chfdw_release_scan_connection(UserMapping* user, ch_scan_connection sconn);
-extern void
-chfdw_exec_query(ch_connection conn, const char* query);
-extern void
-chfdw_report_error(int elevel, ch_connection conn, bool clear, const char* sql);
 
 /* in option.c */
 extern kv_list*

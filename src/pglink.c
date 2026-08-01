@@ -21,7 +21,6 @@
 #include "cursor.h"
 #include "fdw.h"
 #include "http.h"
-#include "http_streaming.h"
 #include "pg-clickhouse-decode.h"
 #include "pg-clickhouse-encode.h"
 
@@ -198,30 +197,6 @@ http_server_version(void* conn) {
     return ch_http_server_version((ch_http_connection_t*)conn, http_canceled);
 }
 
-/*
- * Return text before version mentioning
- */
-static char*
-format_error(char* errstring) {
-    size_t n = strlen(errstring);
-
-    for (size_t i = 0; i < n; i++) {
-        if (strncmp(errstring + i, "version", 7) == 0) {
-            return pnstrdup(errstring, i - 2);
-        }
-    }
-
-    /*
-     * For some reason ClickHouse 25.12 added a newline to an auth failure
-     * error. Strip it out.
-     */
-    if (n > 0 && errstring[n - 1] == '\n') {
-        errstring[--n] = '\0';
-    }
-
-    return errstring;
-}
-
 static void
 kill_query(void* conn, const char* query_id) {
     ch_http_response_t* resp;
@@ -279,7 +254,7 @@ report_http_stream_query_failure(
             ereport(
                 ERROR,
                 errcode(ERRCODE_SQL_ROUTINE_EXCEPTION),
-                errmsg("pg_clickhouse: %s", format_error(error)),
+                errmsg("pg_clickhouse: %s", ch_http_format_error(error)),
                 status < 404 ? 0
                              : errdetail_internal("Remote Query: %.64000s", query->sql),
                 errcontext("HTTP status code: %li", status)
@@ -338,7 +313,7 @@ again:
         ereport(
             ERROR,
             errcode(ERRCODE_SQL_ROUTINE_EXCEPTION),
-            errmsg("pg_clickhouse: %s", format_error(error)),
+            errmsg("pg_clickhouse: %s", ch_http_format_error(error)),
             status < 404 ? 0 : errdetail_internal("Remote Query: %.64000s", query->sql),
             errcontext("HTTP status code: %li", status)
         );
@@ -384,7 +359,7 @@ http_simple_insert(void* conn, const ch_query* query) {
         ereport(
             ERROR,
             errcode(ERRCODE_SQL_ROUTINE_EXCEPTION),
-            errmsg("pg_clickhouse: %s", format_error(error)),
+            errmsg("pg_clickhouse: %s", ch_http_format_error(error)),
             status < 404 ? 0 : errdetail_internal("Remote Query: %.64000s", query->sql),
             errcontext("HTTP status code: %li", status)
         );

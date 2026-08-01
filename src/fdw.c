@@ -356,7 +356,8 @@ merge_fdw_options(
 Datum
 clickhouse_raw_query(PG_FUNCTION_ARGS) {
     char* connstring = text_to_cstring(PG_GETARG_TEXT_P(1));
-    ch_query query   = new_raw_query(text_to_cstring(PG_GETARG_TEXT_P(0)));
+    ch_query query =
+        new_query(text_to_cstring(PG_GETARG_TEXT_P(0)), 0, NULL, NULL, NULL);
 
     ch_connection_details* details = connstring_parse(connstring);
     ch_connection conn;
@@ -378,13 +379,7 @@ clickhouse_raw_query(PG_FUNCTION_ARGS) {
     }
 
     PG_TRY();
-    {
-        ch_cursor* cursor = conn.methods->simple_query(conn.conn, &query);
-
-        res = conn.is_binary ? chfdw_binary_fetch_raw_data(cursor)
-                             : chfdw_http_fetch_raw_data(cursor);
-        MemoryContextDelete(cursor->memcxt);
-    }
+    { res = conn.methods->raw_query(conn.conn, &query); }
     PG_CATCH();
     {
         conn.methods->disconnect(conn.conn);

@@ -41,20 +41,20 @@
  */
 #define CH_ESCAPED_NAMEDATALEN NAMEDATALEN * 2
 
-/* pglink.c */
+/* pglink.c: an open Native result, whichever driver produced it */
 typedef struct ch_cursor ch_cursor;
 typedef struct ch_cursor {
     MemoryContext memcxt; /* used for cleanup */
     MemoryContextCallback callback;
 
-    void* query_response;
-    void* read_state;
+    void* query_response; /* driver response the reader decodes */
+    void* read_state;     /* pgch_reader over query_response */
     void* conn;
     char* query;
     double request_time;
     double total_time;
     size_t columns_count;
-    /* for Native readers, per returned column: conversion state, target attribute */
+    /* per returned column: conversion state, target attribute */
     void** conversion_states;
     int* fill_dest;
     void (*read_error)(struct ch_cursor*);
@@ -72,6 +72,7 @@ typedef struct ChFdwScanRowContext {
 typedef void (*disconnect_method)(void* conn);
 typedef void (*check_conn_method)(const char* password, UserMapping* user);
 typedef ch_cursor* (*simple_query_method)(void* conn, const ch_query* query);
+typedef text* (*raw_query_method)(void* conn, const ch_query* query);
 typedef Datum* (*cursor_fetch_row_method)(ChFdwScanRowContext* ctx);
 typedef void* (*prepare_insert_method)(
     void* conn,
@@ -90,6 +91,7 @@ typedef ch_server_version (*server_version_method)(void* conn);
 typedef struct {
     disconnect_method disconnect;
     simple_query_method simple_query;
+    raw_query_method raw_query;
     cursor_fetch_row_method fetch_row;
     prepare_insert_method prepare_insert;
     insert_tuple_method insert_tuple;
@@ -104,7 +106,6 @@ typedef struct {
 typedef struct {
     libclickhouse_methods* methods;
     void* conn;
-    bool is_binary;
 } ch_connection;
 
 ch_connection_details*
@@ -120,10 +121,6 @@ chfdw_binary_connect(ch_connection_details* details);
  */
 ch_server_version
 chfdw_get_server_version(UserMapping* user);
-text*
-chfdw_http_fetch_raw_data(ch_cursor* cursor);
-text*
-chfdw_binary_fetch_raw_data(ch_cursor* cursor);
 List*
 chfdw_construct_create_tables(ImportForeignSchemaStmt* stmt, ForeignServer* server);
 char*

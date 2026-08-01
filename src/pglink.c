@@ -43,12 +43,10 @@ typedef struct {
 
 static void
 http_disconnect(void* conn);
-static ch_cursor*
-http_simple_query(void* conn, const ch_query* query);
+static text*
+http_raw_query(void* conn, const ch_query* query);
 static void
 http_simple_insert(void* conn, const ch_query* query);
-static void
-http_cursor_free(void*);
 static ch_cursor*
 http_native_cursor(void* conn, const ch_query* query);
 static void
@@ -78,7 +76,8 @@ http_server_version(void* conn);
 
 static libclickhouse_methods http_methods = {
     .disconnect          = http_disconnect,
-    .simple_query        = http_simple_query,
+    .simple_query        = http_native_cursor,
+    .raw_query           = http_raw_query,
     .fetch_row           = native_fetch_row,
     .prepare_insert      = http_prepare_insert,
     .insert_tuple        = http_insert_tuple,
@@ -91,6 +90,8 @@ static void
 binary_disconnect(void* conn);
 static ch_cursor*
 binary_simple_query(void* conn, const ch_query* query);
+static text*
+binary_raw_query(void* conn, const ch_query* query);
 static void
 binary_cursor_free(void* cursor);
 static bool
@@ -123,6 +124,7 @@ binary_server_version(void* conn);
 static libclickhouse_methods binary_methods = {
     .disconnect          = binary_disconnect,
     .simple_query        = binary_simple_query,
+    .raw_query           = binary_raw_query,
     .fetch_row           = native_fetch_row,
     .prepare_insert      = binary_prepare_insert,
     .insert_tuple        = binary_insert_tuple,
@@ -191,9 +193,8 @@ chfdw_http_connect(ch_connection_details* details) {
         );
     }
 
-    res.conn      = conn;
-    res.methods   = &http_methods;
-    res.is_binary = false;
+    res.conn    = conn;
+    res.methods = &http_methods;
     return res;
 }
 
@@ -305,21 +306,13 @@ report_http_stream_query_failure(
     PG_END_TRY();
 }
 
-static ch_cursor*
-http_simple_query(void* conn, const ch_query* query) {
+/* Whole response body as one text value, for clickhouse_raw_query() */
+static text*
+http_raw_query(void* conn, const ch_query* query) {
     int attempts = 0;
-    if (!query->raw_result) {
-        return http_native_cursor(conn, query);
-    }
-    /*
-     * volatile: changed after setjmp (PG_TRY) and read after longjmp
-     * (PG_CATCH); longjmp needn't restore register-cached locals, so a
-     * non-volatile such local has an indeterminate value per C setjmp rules.
-     */
-    volatile MemoryContext tempcxt = NULL;
-    MemoryContext oldcxt;
-    ch_cursor* cursor;
     ch_http_response_t* resp;
+    /* volatile: assigned inside PG_TRY, so longjmp may leave it in a register */
+    text* volatile result;
 
 again:
     resp = ch_http_simple_query(conn, query, http_canceled);
@@ -368,40 +361,14 @@ again:
 
     PG_TRY();
     {
-        /*
-         * If any palloc below throws, use PG_CATCH to free the Curl response.
-         */
-        tempcxt = AllocSetContextCreate(
-            PortalContext, "pg_clickhouse cursor", ALLOCSET_DEFAULT_SIZES
-        );
-        oldcxt = MemoryContextSwitchTo(tempcxt);
-
-        cursor                 = palloc0(sizeof(ch_cursor));
-        cursor->conn           = conn;
-        cursor->query_response = resp;
-        cursor->query          = pstrdup(query->sql);
-        cursor->request_time   = resp->pretransfer_time * 1000;
-        cursor->total_time     = resp->total_time * 1000;
-
-        cursor->memcxt        = tempcxt;
-        cursor->callback.func = http_cursor_free;
-        cursor->callback.arg  = cursor;
-        MemoryContextRegisterResetCallback(tempcxt, &cursor->callback);
-        MemoryContextSwitchTo(oldcxt);
+        result =
+            resp->data ? cstring_to_text_with_len(resp->data, resp->datasize) : NULL;
     }
-    PG_CATCH();
-    {
-        if (resp) {
-            ch_http_response_free(resp);
-        }
-        if (tempcxt) {
-            MemoryContextDelete(tempcxt);
-        }
-        PG_RE_THROW();
-    }
+    PG_FINALLY();
+    { ch_http_response_free(resp); }
     PG_END_TRY();
 
-    return cursor;
+    return result;
 }
 
 static void
@@ -439,11 +406,6 @@ http_simple_insert(void* conn, const ch_query* query) {
     }
 
     ch_http_response_free(resp);
-}
-
-inline static void
-http_cursor_free(void* c) {
-    ch_http_response_free(((ch_cursor*)c)->query_response);
 }
 
 /* pgch_chunk_source cancellation poll, checked between reads. */
@@ -570,17 +532,6 @@ again:
     configure_native_cursor(cursor, query);
 
     return cursor;
-}
-
-text*
-chfdw_http_fetch_raw_data(ch_cursor* cursor) {
-    ch_http_response_t* resp = cursor->query_response;
-
-    if (resp->data == NULL) {
-        return NULL;
-    }
-
-    return cstring_to_text_with_len(resp->data, resp->datasize);
 }
 
 /*
@@ -804,9 +755,8 @@ ch_connection
 chfdw_binary_connect(ch_connection_details* details) {
     ch_connection res;
 
-    res.conn      = ch_binary_connect(details);
-    res.methods   = &binary_methods;
-    res.is_binary = true;
+    res.conn    = ch_binary_connect(details);
+    res.methods = &binary_methods;
     return res;
 }
 
@@ -919,14 +869,14 @@ append_tsv_escaped(StringInfo buf, const char* s) {
 }
 
 /*
- * Drain a binary cursor into tab-separated rows, mirroring the single-text
+ * Drain a Native cursor into tab-separated rows, mirroring the single-text
  * result of the http path. Nulls render as \N, other values escape the
  * control characters CH's TabSeparated format does so they stay unambiguous.
  * Output formatting otherwise differs from the http driver since values pass
  * through PG output functions rather than ClickHouse's wire formatting.
  */
-text*
-chfdw_binary_fetch_raw_data(ch_cursor* cursor) {
+static text*
+render_native_tsv(ch_cursor* cursor) {
     pgch_reader* state = cursor->read_state;
     size_t ncols       = pgch_reader_columns(state);
     StringInfoData buf;
@@ -970,6 +920,21 @@ chfdw_binary_fetch_raw_data(ch_cursor* cursor) {
     }
 
     return cstring_to_text_with_len(buf.data, buf.len);
+}
+
+static text*
+binary_raw_query(void* conn, const ch_query* query) {
+    ch_cursor* cursor = binary_simple_query(conn, query);
+    /* volatile: assigned inside PG_TRY, so longjmp may leave it in a register */
+    text* volatile result;
+
+    PG_TRY();
+    { result = render_native_tsv(cursor); }
+    PG_FINALLY();
+    { MemoryContextDelete(cursor->memcxt); }
+    PG_END_TRY();
+
+    return result;
 }
 
 /*

@@ -763,7 +763,11 @@ ch_http_server_version(ch_http_connection_t* conn, ch_cancel_check cancel) {
                     /* Version string probably trash; zero out. */
                     conn->version = none;
                 }
-            } else if (resp->http_status != CH_HTTP_STATUS_OK) {
+            } else if (
+                resp->http_status != CH_HTTP_STATUS_OK &&
+                resp->http_status != CH_HTTP_STATUS_NOT_FOUND
+            ) {
+                /* 404 means a missing database, which the query itself reports */
                 elog(
                     WARNING,
                     "pg_clickhouse: SELECT version() failed (HTTP status %d): %s",

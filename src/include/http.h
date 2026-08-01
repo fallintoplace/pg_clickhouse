@@ -14,6 +14,7 @@
  * and libcurl transport failures through the existing response machinery.
  */
 #define CH_HTTP_STATUS_OK 200L
+#define CH_HTTP_STATUS_NOT_FOUND 404L
 #define CH_HTTP_STATUS_CANCELED 418L
 #define CH_HTTP_STATUS_TRANSPORT_ERROR 419L
 

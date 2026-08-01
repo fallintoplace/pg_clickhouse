@@ -51,7 +51,6 @@ struct HttpStream {
     char* buf;
     size_t buf_allocated;
     size_t write_pos;
-    size_t parse_pos;
     int32 fetch_size; /* approximate batch size in bytes */
     bool native;
     bool paused;
@@ -342,33 +341,29 @@ pump(HttpStream* stream) {
     return 0;
 }
 
-/* Blocking byte reader for clickhouse-c chc_io. */
-int
-ch_http_stream_read(HttpStream* stream, void* dst, size_t len, size_t* out_n) {
-    size_t avail;
+/* Blocking chunk reader; the decoder tracks its position within the chunk. */
+bool
+ch_http_stream_next_chunk(void* ud, const void** data, size_t* len, char** error) {
+    HttpStream* stream = (HttpStream*)ud;
 
-    *out_n = 0;
+    *data = NULL;
+    *len  = 0;
 
-    while (stream->parse_pos >= stream->write_pos) {
+    /* Caller is done with the previous chunk, so refill from offset 0. */
+    stream->write_pos = 0;
+    while (stream->write_pos == 0) {
         if (stream->transfer_done) {
-            return 0; /* clean EOF */
+            return true; /* clean EOF */
         }
-        /* Reuse buffer after complete drain. */
-        stream->parse_pos = 0;
-        stream->write_pos = 0;
         if (pump(stream) < 0) {
-            return -1;
+            *error = stream->error_msg;
+            return false;
         }
     }
 
-    avail = stream->write_pos - stream->parse_pos;
-    if (len < avail) {
-        avail = len;
-    }
-    memcpy(dst, stream->buf + stream->parse_pos, avail);
-    stream->parse_pos += avail;
-    *out_n = avail;
-    return 0;
+    *data = stream->buf;
+    *len  = stream->write_pos;
+    return true;
 }
 
 /* ----------------------------------------------------------------
@@ -490,12 +485,12 @@ ch_http_stream_end(HttpStream* stream) {
  */
 char*
 ch_http_stream_buffer(HttpStream* stream) {
-    return stream->buf + stream->parse_pos;
+    return stream->buf;
 }
 
 size_t
 ch_http_stream_available(HttpStream* stream) {
-    return stream->write_pos - stream->parse_pos;
+    return stream->write_pos;
 }
 
 long
@@ -528,16 +523,14 @@ ch_http_stream_total_time(HttpStream* stream) {
  *
  * On return, *out_data is a malloc()'d buffer the caller must free(). When
  * status is CH_HTTP_STATUS_TRANSPORT_ERROR the body is the strdup'd libcurl
- * error message; otherwise it is the accumulated response bytes (shifted to
- * offset 0 and NUL-terminated). *out_size is set to the length in bytes,
- * excluding the NUL. Sets *out_data to NULL and *out_size to 0 when there is
- * nothing to hand off. Safe to call at most once per stream; the stream
- * itself should still be released with ch_http_stream_end().
+ * error message; otherwise it is the accumulated response bytes, NUL
+ * terminated. *out_size is set to the length in bytes, excluding the NUL.
+ * Sets *out_data to NULL and *out_size to 0 when there is nothing to hand
+ * off. Safe to call at most once per stream; the stream itself should still
+ * be released with ch_http_stream_end().
  */
 void
 ch_http_stream_take_body(HttpStream* stream, char** out_data, size_t* out_size) {
-    size_t avail;
-
     if (stream->http_status == CH_HTTP_STATUS_TRANSPORT_ERROR && stream->error_msg) {
         *out_data         = stream->error_msg;
         *out_size         = strlen(stream->error_msg);
@@ -545,19 +538,13 @@ ch_http_stream_take_body(HttpStream* stream, char** out_data, size_t* out_size) 
         return;
     }
 
-    avail = ch_http_stream_available(stream);
-    if (avail == 0 || !stream->buf) {
+    if (stream->write_pos == 0 || !stream->buf) {
         *out_data = NULL;
         *out_size = 0;
         return;
     }
 
-    if (stream->parse_pos > 0) {
-        memmove(stream->buf, stream->buf + stream->parse_pos, avail);
-    }
-    stream->buf[avail] = '\0';
-
     *out_data   = stream->buf;
-    *out_size   = avail;
+    *out_size   = stream->write_pos;
     stream->buf = NULL;
 }

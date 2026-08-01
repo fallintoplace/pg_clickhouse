@@ -22,9 +22,14 @@ ch_http_stream_begin(
 void
 ch_http_stream_end(HttpStream* stream);
 
-/* Return 0 with out_n 0 at clean EOF, -1 on transport error or cancellation. */
-int
-ch_http_stream_read(HttpStream* stream, void* dst, size_t len, size_t* out_n);
+/*
+ * pgch_chunk_source next_chunk over the response body. Bytes stay valid until
+ * the following call. Sets *len 0 at clean EOF; returns false with *error on
+ * transport failure or cancellation. Takes void* so it can be assigned to the
+ * callback slot without this header knowing pg-clickhouse-c.
+ */
+bool
+ch_http_stream_next_chunk(void* stream, const void** data, size_t* len, char** error);
 
 /* accessors — let pglink.c read stream state without seeing the struct */
 char*
@@ -45,8 +50,9 @@ ch_http_stream_total_time(HttpStream* stream);
 /*
  * Transfer ownership of the response body to the caller. On return, *out_data
  * is a malloc()'d buffer (or the strdup'd transport error message when status
- * is CH_HTTP_STATUS_TRANSPORT_ERROR) that the caller must free(). The stream
- * itself is unchanged otherwise and should still be released with
+ * is CH_HTTP_STATUS_TRANSPORT_ERROR) that the caller must free(). Only valid
+ * before the first ch_http_stream_next_chunk call, which reuses the buffer.
+ * The stream itself is unchanged otherwise and should still be released with
  * ch_http_stream_end().
  */
 void

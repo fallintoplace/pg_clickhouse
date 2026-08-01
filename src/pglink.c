@@ -20,7 +20,6 @@
 #include "binary.h"
 #include "fdw.h"
 #include "http.h"
-#include "http_native.h"
 #include "http_streaming.h"
 
 #include <fcntl.h>
@@ -52,6 +51,8 @@ static ch_cursor*
 http_native_cursor(void* conn, const ch_query* query, int32 fetch_size);
 static void
 http_native_read_error(ch_cursor* cursor);
+static void
+http_native_cursor_free(void*);
 static void
 native_cursor_state_free(void*);
 static void
@@ -461,6 +462,12 @@ http_cursor_free(void* c) {
     ch_http_response_free(((ch_cursor*)c)->query_response);
 }
 
+/* pgch_chunk_source cancellation poll, checked between reads. */
+static bool
+native_chunks_cancelled(void* ud pg_attribute_unused()) {
+    return QueryCancelPending || ProcDiePending;
+}
+
 /* Create shared-decoder cursor over HTTP Native response. */
 static ch_cursor*
 http_native_cursor(void* conn, const ch_query* query, int32 fetch_size) {
@@ -470,7 +477,6 @@ http_native_cursor(void* conn, const ch_query* query, int32 fetch_size) {
     HttpStream* volatile stream;
     MemoryContext oldcxt;
     ch_cursor* cursor;
-    ch_http_native* h;
     pgch_reader* state;
 
     ch_http_set_progress_func(http_progress_callback);
@@ -507,26 +513,25 @@ again:
         cursor->query        = pstrdup(query->sql);
         cursor->request_time = ch_http_stream_request_time(stream);
         cursor->total_time   = ch_http_stream_total_time(stream);
+        cursor->read_error   = http_native_read_error;
+        state                = palloc0(sizeof(pgch_reader));
+        cursor->read_state   = state;
 
-        /* Transfer ownership before callback registration can fail. */
-        {
-            HttpStream* owned = stream;
-
-            stream = NULL;
-            h      = ch_http_native_begin(owned, tempcxt);
-        }
-        cursor->query_response = h;
-        cursor->read_error     = http_native_read_error;
-        state                  = palloc0(sizeof(pgch_reader));
-        cursor->read_state     = state;
-        pgch_block_source src  = ch_http_native_block_source(h);
-        pgch_reader_init(state, &src);
-        cursor->columns_count = pgch_reader_columns(state);
-
+        /* Register before taking the stream, so unwinding closes it. */
         cursor->memcxt        = tempcxt;
-        cursor->callback.func = native_cursor_state_free;
+        cursor->callback.func = http_native_cursor_free;
         cursor->callback.arg  = cursor;
         MemoryContextRegisterResetCallback(tempcxt, &cursor->callback);
+        cursor->query_response = stream;
+        stream                 = NULL;
+
+        pgch_chunk_source src = { .ud         = cursor->query_response,
+                                  .next_chunk = ch_http_stream_next_chunk,
+                                  .cancelled  = native_chunks_cancelled };
+
+        /* Blocks decode into tempcxt, outliving the per-row context. */
+        pgch_reader_init_chunks(state, &src, NULL);
+        cursor->columns_count = pgch_reader_columns(state);
 
         MemoryContextSwitchTo(oldcxt);
     }
@@ -642,18 +647,15 @@ chfdw_datum_to_ch_literal(Datum value, Oid type) {
  */
 static void
 http_flush_insert(ch_http_insert_state* state) {
-    /* HTTP Native omits block info and custom serialization, as the reader
-     * in ch_http_native_begin expects. */
-    static const chc_block_opts opts = { .has_block_info           = false,
-                                         .has_custom_serialization = false };
-    pgch_buf body                    = {};
+    pgch_buf body = {};
 
     if (pgch_writer_rows(state->writer) == 0) {
         return;
     }
 
     pgch_buf_append(&body, state->sql_begin, strlen(state->sql_begin));
-    pgch_writer_flush(state->writer, &body, &opts);
+    /* NULL opts: no block info or custom serialization, matching the reader. */
+    pgch_writer_flush(state->writer, &body, NULL);
 
     ch_query query = new_body_query(state->sql, body.data, body.len);
 
@@ -1131,26 +1133,36 @@ native_fetch_row(ChFdwScanRowContext* ctx) {
 
 static void
 http_native_read_error(ch_cursor* cursor) {
-    ch_http_native* h = cursor->query_response;
+    HttpStream* stream = cursor->query_response;
 
-    if (ch_http_native_canceled(h) || QueryCancelPending || ProcDiePending) {
-        const char* qid_src = ch_http_native_query_id(h);
+    if (stream == NULL) {
+        return;
+    }
+
+    if (ch_http_stream_status(stream) == CH_HTTP_STATUS_CANCELED ||
+        QueryCancelPending || ProcDiePending) {
         char qid[CH_HTTP_QUERY_ID_LEN];
 
-        qid[0] = '\0';
-        if (qid_src) {
-            memcpy(qid, qid_src, sizeof(qid));
-        }
-        ch_http_native_free(h);
-        if (qid[0]) {
-            kill_query(cursor->conn, qid);
-        }
+        memcpy(qid, ch_http_stream_query_id(stream), sizeof(qid));
+        /* Drop the transfer before asking the server to kill the query. */
+        ch_http_stream_end(stream);
+        cursor->query_response = NULL;
+        kill_query(cursor->conn, qid);
         ereport(
             ERROR,
             errcode(ERRCODE_SQL_ROUTINE_EXCEPTION),
             errmsg("pg_clickhouse: query was aborted")
         );
     }
+}
+
+static void
+http_native_cursor_free(void* c) {
+    ch_cursor* cursor = c;
+
+    native_cursor_state_free(cursor);
+    ch_http_stream_end(cursor->query_response);
+    cursor->query_response = NULL;
 }
 
 static void
